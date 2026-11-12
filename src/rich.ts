@@ -45,7 +45,7 @@ export const threadOpt = (d: Dest | string) => typeof d !== 'string' && d.thread
 const chatOf = (d: Dest | string) => typeof d === 'string' ? d : d.chat_id
 
 /** Run a Telegram call; if Telegram says "too many requests", wait as long as it asks and try again. */
-async function patient<T>(call: () => Promise<T>): Promise<T> {
+export async function patient<T>(call: () => Promise<T>): Promise<T> {
   for (let i = 0; ; i++) {
     try { return await call() } catch (e: any) {
       const wait = e?.error_code === 429 ? Number(e.parameters?.retry_after ?? 1) : 0

@@ -10,7 +10,11 @@ import { homedir } from 'os'
 import { sendRich, fence, clip, threadOpt, type Dest } from './rich.ts'
 import { SessionManager, AgentSession, stepsMd, AGY_BIN, PERMISSIONS, screenAnsi } from './session.ts'
 import { runTuiCommand } from './tui.ts'
-import { parseQuota, quotaMd, quotaCaption, widgetState, errorState, groupOf, switchOffer, nearlyOut, sampleOf, forecast, USAGE_HTML, type Quota, type Sample } from './widget.ts'
+import { initCards, routeQuery } from './cards/kit.ts'
+import { parseQuota, quotaMd, rememberQuota, sendUsageCard, registerUsage } from './cards/usage.ts'
+import { registerLive } from './cards/live.ts'
+import { sendStatusCard, registerStatus } from './cards/status.ts'
+import { diffList, sendDiffCard, registerDiff } from './cards/diff.ts'
 import { scan, older, remove, human, summary } from './cleanup.ts'
 import { userMessages } from './import.ts'
 import { parseArgs, createProject, NEWPROJECT_HELP, PROJECTS_BASE } from './newproject.ts'
@@ -93,10 +97,7 @@ function run(cmd: string, args: string[], cwd: string, timeout = 120_000): Promi
   })
 }
 const sess = (ctx: Context) => mgr.get(keyFor(ctx))
-function modelName(s: AgentSession): string {
-  const m = s.config.find(c => c.id === 'model')
-  return m?.options.find(o => o.value === m.currentValue)?.name ?? (s.state.model || 'default')
-}
+const modelName = (s: AgentSession) => s.modelName
 
 // --- accounts: /invite /join /users ------------------------------------------------
 const joinTries = new Map<string, number[]>()
@@ -526,6 +527,15 @@ bot.command('steps', async ctx => {
 bot.command('diff', async ctx => {
   if (!gate(ctx)) return
   const cwd = sess(ctx).cwd || loadAccount(keyFor(ctx)).cwd
+  const d = await diffList(cwd)
+  if (!d) { await ctx.reply(`Not a git repository: ${cwd}`); return }
+  if (!d.files.length) { await ctx.reply(`No uncommitted changes in ${cwd}.`); return }
+  if (await sendDiffCard(dest(ctx), keyFor(ctx), d).then(() => true, e => { log('diff card failed, sending text', e); return false })) return
+  await diffText(ctx)
+})
+bot.command('legacy_diff', async ctx => { if (gate(ctx)) await diffText(ctx) })
+async function diffText(ctx: Context): Promise<void> {
+  const cwd = sess(ctx).cwd || loadAccount(keyFor(ctx)).cwd
   const stat = await run('git', ['diff', 'HEAD', '--stat'], cwd)
   if (stat.code !== 0) { await ctx.reply(`Not a git repository: ${cwd}`); return }
   const diff = (await run('git', ['diff', 'HEAD'], cwd)).out
@@ -539,10 +549,16 @@ bot.command('diff', async ctx => {
     writeFileSync(p, diff)
     await bot.api.sendDocument(chatId(ctx), new InputFile(p, 'changes.diff'), threadOpt(dest(ctx))).catch(() => {})
   }
-})
+}
 
 bot.command('status', async ctx => {
   if (!gate(ctx)) return
+  const s = sess(ctx)
+  if (await sendStatusCard(dest(ctx), s).then(() => true, e => { log('status card failed, sending text', e); return false })) return
+  await statusText(ctx)
+})
+bot.command('legacy_status', async ctx => { if (gate(ctx)) await statusText(ctx) })
+async function statusText(ctx: Context): Promise<void> {
   const s = sess(ctx)
   const st = s.state
   const think = s.config.find(c => c.id === 'thought_level')?.currentValue ?? st.thought ?? ''
@@ -558,115 +574,19 @@ bot.command('status', async ctx => {
     `| Model | ${modelName(s)} |`,
     `| Thinking | ${think || 'default'} |`,
     `| Mode | ${mode} |`,
-    `| Live progress | ${st.live === false ? 'off' : 'on'} |`,
+    `| Live progress | ${st.live === false ? 'off' : st.live === 'widget' ? 'card' : 'on'} |`,
     `| Tokens this run | ${s.tokens.input.toLocaleString()} in · ${s.tokens.output.toLocaleString()} out · ${s.tokens.turns} turns |`,
   ].join('\n'))
-})
+}
 // --- agy terminal-only commands (/usage, /credits, /skills …), via a hidden agy terminal ------
-// /usage as a widget: a card with rings, a forecast and a Refresh button (Bot API 10.4). Taps arrive
-// as widget_query updates; we answer at once (15 s limit), do the work, then rewrite the card's state.
-type Card = { key: string; state: string; caption: string; running?: boolean; note?: string }
-const CARDS_FILE = join(DATA, 'usage-cards.json'), HISTORY_FILE = join(DATA, 'quota-history.json')
-const readJson = <T,>(f: string, d: T): T => { try { return JSON.parse(readFileSync(f, 'utf8')) } catch { return d } }
-const usageCards = new Map<string, Card>(Object.entries(readJson<Record<string, Card>>(CARDS_FILE, {}))) // by "chat:message"
-function saveCards(): void {
-  const keep = [...usageCards].slice(-100).map(([k, c]) => [k, { key: c.key, state: c.state, caption: c.caption }])
-  try { writeFileSync(CARDS_FILE, JSON.stringify(Object.fromEntries(keep))) } catch (e) { log('save usage cards', e) }
-}
-let quotaHistory: Sample[] = readJson<Sample[]>(HISTORY_FILE, [])
-/** Read agy's quota and remember it (the last 24 h of readings make the forecast). */
-async function readQuota(): Promise<Quota> {
-  const r = await runTuiCommand('/usage')
-  const q = parseQuota(r.text)
-  if (!q) throw new Error(`could not read agy's quota screen${r.text.trim() ? '' : ' (empty)'}`)
-  rememberQuota(q)
-  return q
-}
-function rememberQuota(q: Quota): void {
-  const now = Math.floor(Date.now() / 1000)
-  quotaHistory = [...quotaHistory.filter(x => now - x.t < 86400), sampleOf(q, now)].slice(-500)
-  try { writeFileSync(HISTORY_FILE, JSON.stringify(quotaHistory)) } catch (e) { log('save quota history', e) }
-}
-// Keep the history going while people use agy: a reading every 15 min, only if some chat ran a turn since the last one.
-let turnsAtSample = -1
-setInterval(() => {
-  const turns = [...mgr.sessions.values()].reduce((n, s) => n + s.tokens.turns, 0)
-  if (turns === turnsAtSample) return
-  turnsAtSample = turns
-  void readQuota().catch(e => log('quota sample', e))
-}, 15 * 60_000)
-
-const modelOpt = (s: AgentSession) => s.config.find(c => c.id === 'model')
-async function cardState(q: Quota, key: string, note?: string): Promise<string> {
-  const s = mgr.get(key), t = s.tokens
-  // agy reports its model list only once it runs: start it when the card may need to offer a switch.
-  if (!modelOpt(s) && nearlyOut(q, groupOf(q, s.state.model ?? '')))
-    await s.ensure().catch(e => log('usage card: start agy', e))
-  const model = modelOpt(s) ? modelName(s) : (s.state.model ?? '')
-  const cur = model ? groupOf(q, model) : -1
-  const offer = switchOffer(q, cur, modelOpt(s)?.options ?? [])
-  return widgetState(q, {
-    tokens: [t.input, t.output, t.turns], cur, model, note, forecast: forecast(q, quotaHistory),
-    ...(offer ? { offer: [offer[0], offer[1].name] } : {}),
-  })
-}
-async function sendUsageWidget(ctx: Context, q: Quota): Promise<void> {
-  const key = keyFor(ctx), state = await cardState(q, key), caption = quotaCaption(q)
-  const m = await (bot.api.raw as any).sendWidget({
-    chat_id: Number(chatId(ctx)), ...threadOpt(dest(ctx)), html: USAGE_HTML, chat_data: state, caption, allow_queries: true,
-  })
-  usageCards.set(`${chatId(ctx)}:${m.message_id}`, { key, state, caption })
-  saveCards()
-}
-/** Run `work` for a card (one at a time), then rewrite the card from a fresh quota reading. */
-async function updateCard(chat: number, message_id: number, from: string, work?: (key: string, q: Quota) => Promise<string>): Promise<void> {
-  const id = `${chat}:${message_id}`
-  const card = usageCards.get(id) ?? { key: keyOf(from, undefined), state: '', caption: '' }
-  usageCards.set(id, card)
-  if (card.running) return // the card updates when the job already running lands
-  card.running = true
-  const edit = (chat_data: string) => (bot.api.raw as any).editMessageWidgetData({ chat_id: chat, message_id, chat_data })
-    .catch((e: any) => { if (!/not modified/.test(String(e))) throw e })
-  try {
-    const q = await readQuota()
-    const note = work ? await work(card.key, q) : undefined
-    card.state = await cardState(q, card.key, note)
-    await edit(card.state)
-    const caption = quotaCaption(q)
-    if (caption !== card.caption) {
-      card.caption = caption
-      await bot.api.editMessageCaption(chat, message_id, { caption }).catch(() => {})
-    }
-    saveCards()
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e)
-    log('usage card failed', msg)
-    let prev: any = null
-    try { prev = JSON.parse(card.state) } catch {}
-    await edit(prev?.g ? JSON.stringify({ ...prev, s: undefined, e: msg.slice(0, 200) }) : errorState(msg)).catch(e2 => log('usage card edit failed', e2))
-  } finally { card.running = false }
-}
-/** The card's "Switch to …" button: move this chat to a model in group `gi` (checked again here). */
-const switchTo = (gi: number) => async (key: string, q: Quota): Promise<string> => {
-  const s = mgr.get(key)
-  await s.ensure()
-  const cur = groupOf(q, modelName(s))
-  const offer = switchOffer(q, cur, modelOpt(s)?.options ?? [])
-  if (!offer || offer[0] !== gi) throw new Error('No switch needed any more.')
-  await s.setConfig('model', offer[1].value)
-  return `Switched this chat to ${offer[1].name}`
-}
+// Cards (Telegram widgets, see src/cards/): taps on them arrive as widget_query updates.
+initCards(bot)
+registerUsage(mgr); registerLive(mgr); registerStatus(mgr); registerDiff()
 bot.use(async (ctx, next) => {
   const q = (ctx.update as any).widget_query
   if (!q) return next()
-  const answer = (data?: string) => (bot.api.raw as any).answerWidgetQuery({ widget_query_id: q.id, ...(data ? { data } : {}) }).catch((e: any) => log('answerWidgetQuery', e))
-  const from = String(q.from?.id ?? '')
-  if (!isMember(from)) { await answer('e:Not authorized.'); return }
-  const m = /^(r|m:(\d))$/.exec(q.data ?? '')
-  if (!m || !q.chat || !q.message_id) { await answer('e:Unknown request.'); return }
-  await answer()
-  // Not awaited: grammy handles updates one at a time, and reading the quota takes ~15 s.
-  void updateCard(q.chat.id, q.message_id, from, m[2] != null ? switchTo(Number(m[2])) : undefined).catch(e => log('usage card', e))
+  // Not awaited: grammy handles updates one at a time; answers are quick, slow work runs after them.
+  void routeQuery(q, isMember).catch(e => log('widget query', e))
 })
 async function tuiCommand(ctx: Context, cmd: string, title: string, legacy = false): Promise<void> {
   if (!gate(ctx)) return
@@ -679,7 +599,7 @@ async function tuiCommand(ctx: Context, cmd: string, title: string, legacy = fal
       const q = parseQuota(body)
       if (q) {
         rememberQuota(q)
-        if (!legacy && await sendUsageWidget(ctx, q).then(() => true, e => { log('sendWidget failed, sending text', e); return false })) return
+        if (!legacy && await sendUsageCard(dest(ctx), keyFor(ctx), q).then(() => true, e => { log('usage card failed, sending text', e); return false })) return
         await sendRich(bot, dest(ctx), quotaMd(q, `${s.tokens.input.toLocaleString()} input · ${s.tokens.output.toLocaleString()} output tokens in ${s.tokens.turns} turns`))
         return
       }
@@ -731,11 +651,25 @@ bot.command('sessions', async ctx => {
   await sendRich(bot, dest(ctx), lines.join('\n'), { reply_markup: kb })
 })
 
+const LIVE_MODES = { off: false, on: true, widget: 'widget' } as const
+const LIVE_TEXT: Record<string, string> = {
+  off: '⚪ Live progress is off. You only get the final reply.',
+  on: '🟢 Live progress is on: a streaming text draft while agy works.',
+  widget: '🃏 Live progress is a card: one live run card per turn (timer, current step, counters, Stop), then the reply.',
+}
+const liveName = (v: boolean | 'widget' | undefined) => v === false ? 'off' : v === 'widget' ? 'widget' : 'on'
 bot.command('live', async ctx => {
   if (!gate(ctx)) return
-  const on = loadAccount(keyFor(ctx)).live === false
-  saveAccount(keyFor(ctx), { live: on })
-  await ctx.reply(on ? '🟢 Live progress is on.' : '⚪ Live progress is off. You only get the final reply.')
+  const want = arg(ctx).toLowerCase().replace(/^card$/, 'widget')
+  if (want in LIVE_MODES) {
+    saveAccount(keyFor(ctx), { live: LIVE_MODES[want as keyof typeof LIVE_MODES] })
+    await ctx.reply(LIVE_TEXT[want]!)
+    return
+  }
+  const cur = liveName(loadAccount(keyFor(ctx)).live)
+  const kb = new InlineKeyboard()
+  for (const [k, label] of [['off', '⚪ Off'], ['on', '🟢 On (text)'], ['widget', '🃏 Card']] as const) kb.text(`${k === cur ? '• ' : ''}${label}`, `lv:${k}`)
+  await ctx.reply(`Live progress: ${cur === 'widget' ? 'card' : cur}. Choose, or send /live off · /live on · /live widget.`, { reply_markup: kb })
 })
 
 // agy's own CLI management commands, run as `agy <sub> <args>`.
@@ -801,7 +735,7 @@ bot.command('help', async ctx => {
     ...(topicsOn ? ['**Topics:** each topic is its own chat, named `project - chat title`. /new, /resume, /project and /newproject open a new topic; /topics lists and deletes them; /import makes a topic for each earlier agy chat with more than 3 messages from you (`/import 1` for all). Topics of one project share an icon; /icon changes it. Rename a topic yourself and the bot leaves the name alone.'] : []),
     '**agy settings:** /model · /think (thinking level) · /mode (agent mode + tool permission) · /turbo · /permission ask|turbo|sandbox|strict · /config · /restart',
     '**agy tools:** /mcp · /plugins · /agents · /models · /changelog (add arguments to pass them on, e.g. `/mcp disable github`)',
-    '**See what happened:** /screen · /steps · /diff · /status · /sessions · /live',
+    '**See what happened:** /screen · /steps · /diff (card; /legacy_diff as text) · /status (control panel; /legacy_status as text) · /sessions · /live off|on|widget',
     '**agy account:** /usage (quota card; /legacy_usage as text) · /credits · /skills · /tui <any agy terminal command>',
     '**Shell:** `!git status` runs directly on the server',
     `**agy's own commands** (sent to agy as typed): ${agyCmds}`,
@@ -852,6 +786,12 @@ bot.on('callback_query:data', async ctx => {
       await s.setConfig(c.id, o.value)
       await ctx.reply(`${c.name}: ${o.name}`)
     } catch (e) { await ctx.reply(`⚠️ ${e instanceof Error ? e.message : e}`) }
+    return
+  }
+  if ((m = /^lv:(off|on|widget)$/.exec(data))) {
+    await done(); await clearKb()
+    saveAccount(keyFor(ctx), { live: LIVE_MODES[m[1] as keyof typeof LIVE_MODES] })
+    await ctx.reply(LIVE_TEXT[m[1]!]!)
     return
   }
   if ((m = /^tp:(\d+)$/.exec(data))) {
@@ -1024,10 +964,10 @@ bot.on('message', async ctx => {
 const BOT_COMMANDS = [
   ['new', 'Start a new chat'], ['resume', 'Open a previous chat'], ['stop', 'Stop what agy is doing'],
   ['model', 'Choose the model'], ['think', 'Thinking level (low/medium/high)'], ['mode', 'Agent mode and tool permission (turbo)'], ['turbo', 'Run commands without asking'],
-  ['project', 'Switch folder'], ['newproject', 'Create a project (optionally from a git repo)'], ['steps', 'Steps of the last turn, with outputs'], ['diff', 'Uncommitted changes'],
-  ['status', 'Folder, model, mode, chat'], ['sessions', 'Who is running what'], ['topics', 'Your topics (one chat each)'], ['import', 'Make topics from your earlier agy chats'], ['icon', 'Choose the icon for this project\'s topics'], ['mcp', 'agy MCP servers'],
+  ['project', 'Switch folder'], ['newproject', 'Create a project (optionally from a git repo)'], ['steps', 'Steps of the last turn, with outputs'], ['diff', 'Uncommitted changes (tap a file)'], ['legacy_diff', 'Uncommitted changes as text'],
+  ['status', 'Control panel: model, thinking, mode, tools, live'], ['legacy_status', 'Status as text'], ['sessions', 'Who is running what'], ['topics', 'Your topics (one chat each)'], ['import', 'Make topics from your earlier agy chats'], ['icon', 'Choose the icon for this project\'s topics'], ['mcp', 'agy MCP servers'],
   ['plugins', 'agy plugins'], ['agents', 'agy agents'], ['config', 'agy settings'], ['restart', 'Restart your agy (admin: all, bot, claude)'],
-  ['live', 'Toggle live progress'], ['usage', 'agy quota (5-hour and weekly limits)'], ['legacy_usage', 'agy quota as text'], ['screen', 'Terminal-style screenshot'], ['credits', 'agy credits'], ['skills', 'agy skills'], ['users', 'Manage accounts (admin)'],
+  ['live', 'Live progress: off, on (text) or widget (card)'], ['usage', 'agy quota (5-hour and weekly limits)'], ['legacy_usage', 'agy quota as text'], ['screen', 'Terminal-style screenshot'], ['credits', 'agy credits'], ['skills', 'agy skills'], ['users', 'Manage accounts (admin)'],
   ['invite', 'Invite another account (admin)'], ['cleanup', 'Delete saved files (admin)'], ['help', 'All commands'],
 ].map(([command, description]) => ({ command: command!, description: description! }))
 const menuSent = new Map<string, string>()

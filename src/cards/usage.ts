@@ -1,6 +1,13 @@
-// /usage as a Telegram widget (Bot API 10.4): a small HTML card drawn inside the message, with a
-// refresh button. The HTML is fixed when sent; what changes is its chat state (chat_data, ≤1024
-// bytes of JSON), which the bot rewrites with editMessageWidgetData. See core.telegram.org/bots/widgets.
+// /usage as a card (see kit.ts): a ring per limit with the reset time inside, a forecast, the group of
+// this chat's model, a Refresh button and, when that group is nearly out, a one-tap model switch.
+import { page } from './kit.ts'
+import { readFileSync, writeFileSync } from 'fs'
+import { join } from 'path'
+import { DATA } from '../store.ts'
+import { runTuiCommand } from '../tui.ts'
+import type { SessionManager, AgentSession } from '../session.ts'
+import type { Dest } from '../rich.ts'
+import { onCard, sendCard, editCard, editError, setCaption, exclusive } from './kit.ts'
 
 export type QuotaLimit = { name: string; pct: number; resetsIn?: number } // resetsIn: seconds
 export type QuotaGroup = { name: string; models: string; limits: QuotaLimit[] }
@@ -120,19 +127,9 @@ export function forecast(q: Quota, history: Sample[], now = Math.floor(Date.now(
   }))
 }
 
-export const errorState = (msg: string) => JSON.stringify({ e: msg.slice(0, 200) })
 
-// The widget itself. Keep it small: ≤4096 bytes after zlib -9 (checked in sendUsageWidget's caller
-// by Telegram; `bun src/widget.ts` prints the size). Colors come from the chat theme.
-export const USAGE_HTML = `<style>
-body{margin:0;padding:10px 12px max(10px,env(safe-area-inset-bottom));font:14px/1.35 system-ui,sans-serif}
-.h{display:flex;align-items:center;gap:8px;margin-bottom:6px}
-.h b{font-size:1.05em;flex:1}
-.mu{color:var(--tg-theme-hint-color);font-size:.82em}
-button{padding:4px 10px;font-size:.85em;border-radius:14px;flex:none}
-.sp{display:inline-block}.busy .sp{animation:r 1s linear infinite}
-@keyframes r{to{transform:rotate(360deg)}}
-.g{margin-top:10px}
+// The card. Keep it small: ≤4096 bytes after zlib -9 (`bun src/cards/sizes.ts` prints the sizes).
+export const USAGE_HTML = page(`.g{margin-top:10px}
 .gn{font-weight:600}
 .pies{display:flex;gap:10px;margin-top:6px}
 .c{flex:1;display:flex;align-items:center;gap:8px;min-width:0}
@@ -143,21 +140,11 @@ button{padding:4px 10px;font-size:.85em;border-radius:14px;flex:none}
 .in b{font-size:1.15em}
 .ok{--k:var(--tg-theme-button-color)}.mid{--k:light-dark(#c77c00,#f0a830)}.low{--k:var(--tg-theme-destructive-text-color)}
 .p{font-variant-numeric:tabular-nums;font-weight:600;font-size:1.15em}
-.e{color:var(--tg-theme-destructive-text-color);font-size:.85em;margin-top:8px}
 .bad{color:var(--tg-theme-destructive-text-color);font-size:.82em}
 .cur{color:var(--tg-theme-accent-text-color);font-weight:400;font-size:.82em}
-.sw{margin-top:10px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}.sw .mu{flex:1}
-.nt{color:var(--tg-theme-accent-text-color);font-size:.85em;margin-top:8px}
-.f{margin-top:10px;padding-top:6px;border-top:1px solid var(--tg-theme-section-separator-color)}
-</style>
-<div class="h"><b>📊 agy quota</b><button id="rb" onclick="refresh()"><span class="sp">↻</span> Refresh</button></div>
-<div id="v"></div>
-<script>
-var W=window.TelegramWidget,st=null,err='',busy=0,bt=0;
-function esc(s){return String(s).replace(/[&<>"]/g,function(c){return'&#'+c.charCodeAt(0)+';'})}
-function dur(s){if(s<0)return'';s=Math.max(0,s);var d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return d?d+'d '+h+'h':h?h+'h '+m+'m':m+'m'}
+.sw{margin-top:10px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}.sw .mu{flex:1}`, `<div class="h"><b>📊 agy quota</b><button id="rb" onclick="refresh()"><span class="sp">↻</span> Refresh</button></div>
+<div id="v"></div>`, `var st=null;
 function fc(f,el){if(f==null)return'<div class="mu">left</div>';if(f==-2)return'<div class="mu">lasts ✓</div>';f-=el;return'<div class="bad">'+(f>60?'empty ~'+dur(f):'empty')+'</div>'}
-function n(x){return x>=1e6?(x/1e6).toFixed(1)+'M':x>=1e4?Math.round(x/1e3)+'k':x>=1e3?(x/1e3).toFixed(1)+'k':''+x}
 function load(){var d=null;try{d=JSON.parse(W.chatData)}catch(e){}if(!d)return;if(d.g)st=d;err=d.e||''}
 function render(){
 var h='',now=Date.now()/1e3;
@@ -180,19 +167,85 @@ if(err)h+='<div class="e">⚠️ '+esc(err)+'</div>';
 document.getElementById('v').innerHTML=h;
 var b=document.getElementById('rb');b.disabled=!!busy||W.isForward;b.className=busy?'busy':'';
 b.lastChild.nodeValue=busy?' Refreshing…':' Refresh'}
-function done(e){busy=0;clearTimeout(bt);if(e!=null)err=e;render()}
-function refresh(){req('r')}
-function sw(){if(st&&st.w)req('m:'+st.w[0])}
-function req(d){
-if(busy)return;busy=1;err='';render();
-bt=setTimeout(function(){done('No answer from the bot.')},90000);
-W.request(d).then(function(a){var r=a.result||'';if(r.indexOf('e:')==0)done(r.slice(2))},function(e){done({RATE_LIMITED:'Too many taps, wait a few seconds.',TIMEOUT:'The bot did not answer.',NOT_ALLOWED:'Not available here.'}[e.code]||'Request failed ('+e.code+').')})}
-if(!W)W={chatData:null,isForward:false,onEvent:function(){},request:function(){return Promise.reject({code:'NOT_ALLOWED'})}};
+function refresh(){req('r',null,1)}
+function sw(){if(st&&st.w)req('m:'+st.w[0],null,1)}
 W.onEvent('chatDataChanged',function(){load();done()});
-load();render();setInterval(render,30000);
-</script>`
+load();render();setInterval(render,30000);`)
 
-if (import.meta.main) {
-  const { deflateSync } = await import('zlib')
-  console.log(`USAGE_HTML: ${Buffer.byteLength(USAGE_HTML)} bytes, ${deflateSync(USAGE_HTML, { level: 9 }).length} compressed (limit 4096; Python's zlib is exact)`)
+// --- the bot side -----------------------------------------------------------------------------
+
+const log = (...a: unknown[]) => console.error(new Date().toISOString(), ...a)
+const HISTORY_FILE = join(DATA, 'quota-history.json'), LAST_FILE = join(DATA, 'quota-last.json')
+const readJson = <T,>(f: string, d: T): T => { try { return JSON.parse(readFileSync(f, 'utf8')) } catch { return d } }
+let quotaHistory: Sample[] = readJson<Sample[]>(HISTORY_FILE, [])
+let lastQuota: { t: number; q: Quota } | null = readJson<{ t: number; q: Quota } | null>(LAST_FILE, null)
+/** The most recent reading (for the mini ring on /status), without starting agy. */
+export const latestQuota = () => lastQuota
+
+/** Remember a reading: the last 24 h of them make the forecast. */
+export function rememberQuota(q: Quota): void {
+  const now = Math.floor(Date.now() / 1000)
+  quotaHistory = [...quotaHistory.filter(x => now - x.t < 86400), sampleOf(q, now)].slice(-500)
+  lastQuota = { t: now, q }
+  try { writeFileSync(HISTORY_FILE, JSON.stringify(quotaHistory)); writeFileSync(LAST_FILE, JSON.stringify(lastQuota)) } catch (e) { log('save quota history', e) }
+}
+/** Read agy's quota (a hidden agy terminal, ~15 s) and remember it. */
+export async function readQuota(): Promise<Quota> {
+  const r = await runTuiCommand('/usage')
+  const q = parseQuota(r.text)
+  if (!q) throw new Error(`could not read agy's quota screen${r.text.trim() ? '' : ' (empty)'}`)
+  rememberQuota(q)
+  return q
+}
+
+const modelOpt = (s: AgentSession) => s.config.find(c => c.id === 'model')
+let mgr: SessionManager
+async function usageState(q: Quota, key: string, note?: string): Promise<string> {
+  const s = mgr.get(key), t = s.tokens
+  // agy reports its model list only once it runs: start it when the card may need to offer a switch.
+  if (!modelOpt(s) && nearlyOut(q, groupOf(q, s.state.model ?? '')))
+    await s.ensure().catch(e => log('usage card: start agy', e))
+  const model = modelOpt(s) ? s.modelName : (s.state.model ?? '')
+  const cur = model ? groupOf(q, model) : -1
+  const offer = switchOffer(q, cur, modelOpt(s)?.options ?? [])
+  return widgetState(q, {
+    tokens: [t.input, t.output, t.turns], cur, model, note, forecast: forecast(q, quotaHistory),
+    ...(offer ? { offer: [offer[0], offer[1].name] } : {}),
+  })
+}
+export async function sendUsageCard(dest: Dest, key: string, q: Quota): Promise<void> {
+  await sendCard(dest, 'usage', key, USAGE_HTML, await usageState(q, key), quotaCaption(q))
+}
+/** The "Switch to …" button: move this chat to a model in group `gi` (checked again here). */
+async function switchTo(key: string, q: Quota, gi: number): Promise<string> {
+  const s = mgr.get(key)
+  await s.ensure()
+  const offer = switchOffer(q, groupOf(q, s.modelName), modelOpt(s)?.options ?? [])
+  if (!offer || offer[0] !== gi) throw new Error('No switch needed any more.')
+  await s.setConfig('model', offer[1].value)
+  return `Switched this chat to ${offer[1].name}`
+}
+export function registerUsage(m: SessionManager): void {
+  mgr = m
+  onCard('usage', async ({ data, id, card }) => {
+    const sw = /^m:(\d)$/.exec(data)
+    if (data !== 'r' && !sw) return 'e:Unknown request.'
+    // Answered now; the quota takes ~15 s to read, then the card's state is rewritten.
+    void exclusive(id, async () => {
+      try {
+        const q = await readQuota()
+        const note = sw ? await switchTo(card.key, q, Number(sw[1])) : undefined
+        await editCard(id, await usageState(q, card.key, note))
+        await setCaption(id, quotaCaption(q))
+      } catch (e) { await editError(id, e instanceof Error ? e.message : String(e)) }
+    })
+  })
+  // Keep the history going while people use agy: a reading every 15 min, only if some chat ran a turn since the last one.
+  let turnsAtSample = -1
+  setInterval(() => {
+    const turns = [...mgr.sessions.values()].reduce((n, s) => n + s.tokens.turns, 0)
+    if (turns === turnsAtSample) return
+    turnsAtSample = turns
+    void readQuota().catch(e => log('quota sample', e))
+  }, 15 * 60_000)
 }

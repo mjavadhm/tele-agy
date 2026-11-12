@@ -7,6 +7,8 @@ import { sendRich, sendDraft, fence, clip, threadOpt, type Dest } from './rich.t
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs'
 import { join } from 'path'
 import { loadAccount, saveAccount, loadShared, splitKey, DEFAULT_CWD, type AccountState } from './store.ts'
+import { KIND_ICON, LIVE_HTML, liveState, type LiveStatus } from './cards/live.ts'
+import { sendCard, editCard, setCaption } from './cards/kit.ts'
 
 export const AGY_BIN = process.env.AGY_BIN ?? `${process.env.HOME ?? '/root'}/.local/bin/agy`
 export const AGY_SETTINGS = join(process.env.HOME ?? '/root', '.gemini', 'antigravity-cli', 'settings.json')
@@ -29,6 +31,7 @@ function writeToolPermission(value: string): void {
 }
 const DRAFT_EVERY_MS = 1200
 const DRAFT_REFRESH_MS = 20_000 // drafts expire after ~30 s; keep them alive
+const CARD_EVERY_MS = 3000 // live card edits count as sent messages: at most one per 3 s
 
 export type Step = { id: string; label: string; kind: string; input: string; output: string | null; status: string }
 export type PlanEntry = { content: string; status: string }
@@ -48,6 +51,13 @@ type Turn = {
   lastDraft: string
   lastDraftAt: number
   timer: ReturnType<typeof setInterval>
+  usage?: [number, number] // this turn's tokens, when agy reports them
+  // The live card (/live widget): its id once sent, the state last written, and when.
+  card?: string
+  cardState?: string
+  cardAt?: number
+  cardBusy?: Promise<void>
+  cardFailed?: boolean // could not send it: this turn uses the draft
 }
 type Queued = { blocks: any[] }
 
@@ -73,9 +83,6 @@ function stepOutput(u: any): string | null {
   if (parts.length) return parts.join('\n')
   if (u.rawOutput != null) return typeof u.rawOutput === 'string' ? u.rawOutput : (u.rawOutput.output ?? JSON.stringify(u.rawOutput, null, 1))
   return null
-}
-const KIND_ICON: Record<string, string> = {
-  execute: '⚙️', read: '📄', edit: '✏️', delete: '🗑', move: '📦', search: '🔍', fetch: '🌐', think: '💭', other: '🔧',
 }
 
 export function stepMd(st: Step, inN = 600, outN = 800): string {
@@ -137,6 +144,12 @@ export class AgentSession {
   get state(): AccountState { return loadAccount(this.key) }
   get running(): boolean { return Boolean(this.acp?.running) }
   configValue(id: string): string { return this.config.find(c => c.id === id)?.currentValue ?? '' }
+  /** The display name of a setting's current value (model, thought_level, mode), if agy reported it. */
+  configName(id: string): string {
+    const c = this.config.find(x => x.id === id)
+    return c?.options.find(o => o.value === c.currentValue)?.name ?? c?.currentValue ?? ''
+  }
+  get modelName(): string { return this.configName('model') || this.state.model || 'default' }
 
   /** Start agy (if needed) and open the account's chat. */
   ensure(): Promise<void> {
@@ -289,7 +302,7 @@ export class AgentSession {
       const r: any = await this.acp!.request('session/prompt', { sessionId: this.sessionId, prompt: q.blocks })
       stop = r?.stopReason ?? ''
       const u = r?.usage
-      if (u) { this.tokens.input += u.inputTokens ?? 0; this.tokens.output += u.outputTokens ?? 0 }
+      if (u) { this.tokens.input += u.inputTokens ?? 0; this.tokens.output += u.outputTokens ?? 0; t.usage = [u.inputTokens ?? 0, u.outputTokens ?? 0] }
       this.tokens.turns++
     } catch (e) {
       if (this.turn === t) await this.finishTurn(`⚠️ ${e instanceof Error ? e.message : e}`)
@@ -306,6 +319,7 @@ export class AgentSession {
     if (!t) return
     clearInterval(t.timer)
     this.turn = null
+    if (t.card || t.cardBusy) await this.closeCard(t, note)
     this.lastUsed = Date.now()
     if (t.steps.length) this.lastSteps = t.steps
     this.lastTurn = { prompt: t.prompt, text: t.text, steps: t.steps, plan: t.plan, note, secs: Math.round((Date.now() - t.started) / 1000) }
@@ -347,9 +361,44 @@ export class AgentSession {
     return out.join('\n\n')
   }
 
+  private liveStatus(t: Turn): LiveStatus { return t.thinking && !t.text ? 'think' : t.text ? 'write' : 'work' }
+  private liveInput(t: Turn) { return { started: t.started, model: this.configName('model'), steps: t.steps, plan: t.plan } }
+
+  /** The live card: sent when the turn starts, then rewritten at most every 3 s when something changed. */
+  private async pushCard(t: Turn): Promise<void> {
+    if (t.cardBusy) return
+    const state = liveState({ ...this.liveInput(t), status: this.liveStatus(t) })
+    if (t.card && (state === t.cardState || Date.now() - (t.cardAt ?? 0) < CARD_EVERY_MS)) return
+    t.cardBusy = (async () => {
+      t.cardAt = Date.now()
+      try {
+        if (!t.card) t.card = await sendCard(this.dest, 'live', this.key, LIVE_HTML, state, `▶ ${clip(t.prompt.replace(/\s+/g, ' '), 300) || 'agy is working'}`, { started: t.started }, true)
+        else await editCard(t.card, state)
+        t.cardState = state
+      } catch (e) {
+        log(`[${this.key}] live card failed`, String(e))
+        if (!t.card) { t.cardFailed = true; void this.pushDraft(true) } // fall back to the draft for this turn
+      }
+    })().finally(() => { t.cardBusy = undefined })
+  }
+  /** The card's last state: done, stopped or failed, with the time, steps and tokens. */
+  private async closeCard(t: Turn, note: string): Promise<void> {
+    if (t.cardBusy) await t.cardBusy
+    if (!t.card) return
+    const secs = Math.round((Date.now() - t.started) / 1000)
+    const status: LiveStatus = /^⏹/.test(note) ? 'stop' : /^⚠️/.test(note) ? 'err' : 'done'
+    await editCard(t.card, liveState({ ...this.liveInput(t), status, secs, tokens: t.usage, note: status === 'err' ? note.replace(/^\S+\s*/, '') : status === 'done' ? note : undefined }))
+      .catch(e => log(`[${this.key}] live card close failed`, String(e)))
+    const what = status === 'done' ? '✓ Done' : status === 'stop' ? '⏹ Stopped' : '⚠️ Stopped'
+    await setCaption(t.card, `${what} in ${secs}s${t.steps.length ? ` · ${t.steps.length} step${t.steps.length > 1 ? 's' : ''}` : ''} · ${clip(t.prompt.replace(/\s+/g, ' '), 200)}`)
+  }
+
   private async pushDraft(force = false): Promise<void> {
     const t = this.turn
-    if (!t || this.state.live === false || this.mgr.liveBroken) return
+    const live = this.state.live
+    if (!t || live === false) return
+    if (live === 'widget' && !t.cardFailed) return this.pushCard(t)
+    if (this.mgr.liveBroken) return
     const md = this.renderLive(t)
     const now = Date.now()
     if (!force && md === t.lastDraft && now - t.lastDraftAt < DRAFT_REFRESH_MS) return

@@ -21,7 +21,7 @@ export type AccountState = {
   thought?: string
   mode?: string
   permission?: string // agy toolPermission: request-review | always-proceed (turbo) | proceed-in-sandbox | strict-mode
-  live?: boolean
+  live?: boolean | 'widget' // live progress: true = streaming draft, false = off, 'widget' = live run card
   title?: string // agy's title of the open chat
   topicName?: string // the Telegram topic's name as we last set it
   manualName?: boolean // the user renamed the topic; don't rename it again
