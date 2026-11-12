@@ -1,0 +1,14 @@
+{
+  "name": "agy-telegram",
+  "version": "0.1.0",
+  "description": "Use Google's Antigravity CLI (agy) from Telegram: one agy session per account, streaming replies, permission buttons, terminal-like controls.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "start": "bun src/bot.ts",
+    "check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "grammy": "^1.41.1"
+  }
+}

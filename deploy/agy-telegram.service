@@ -1,0 +1,17 @@
+[Unit]
+Description=agy-telegram: Antigravity CLI (agy) on Telegram
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Environment=HOME=/root
+Environment=PATH=/root/.local/bin:/root/.bun/bin:/usr/local/bin:/usr/bin:/bin
+WorkingDirectory=/root/agy-telegram
+ExecStart=/root/.bun/bin/bun src/bot.ts
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
