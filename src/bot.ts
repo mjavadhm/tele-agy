@@ -10,6 +10,7 @@ import { homedir } from 'os'
 import { sendRich, fence, clip, threadOpt, type Dest } from './rich.ts'
 import { SessionManager, AgentSession, stepsMd, AGY_BIN, PERMISSIONS, screenAnsi } from './session.ts'
 import { runTuiCommand } from './tui.ts'
+import { parseQuota, quotaMd, quotaCaption, widgetState, errorState, USAGE_HTML, type Quota } from './widget.ts'
 import { scan, older, remove, human, summary } from './cleanup.ts'
 import { userMessages } from './import.ts'
 import { parseArgs, createProject, NEWPROJECT_HELP, PROJECTS_BASE } from './newproject.ts'
@@ -562,24 +563,56 @@ bot.command('status', async ctx => {
   ].join('\n'))
 })
 // --- agy terminal-only commands (/usage, /credits, /skills …), via a hidden agy terminal ------
-function quotaMd(text: string): string | null {
-  const rows: string[] = []
-  let group = '', limit = ''
-  for (const raw of text.split('\n')) {
-    const l = raw.trim()
-    if (/^[A-Z][A-Z &]+$/.test(l)) { group = l.replace(/\bMODELS\b/, '').trim(); continue }
-    if (/Limit Remaining$/.test(l)) { limit = l.replace(/ Limit Remaining$/, ''); continue }
-    const pct = /\]\s*([\d.]+)%/.exec(l)
-    if (pct && group && limit) { rows.push(`| ${group} | ${limit} | **${pct[1]}%** left |`); continue }
-    if (rows.length && /^(Refreshes in|Quota available)/.test(l)) rows[rows.length - 1] = rows[rows.length - 1]!.replace(/ \|$/, ` | ${l.replace('Refreshes in ', '')} |`)
-  }
-  if (!rows.length) return null
-  const account = /Account:\s*(\S+)/.exec(text)?.[1]
-  return [`## 📊 agy quota${account ? ` · ${account}` : ''}`, '', '| Models | Limit | Remaining | Refreshes |', '|:--|:--|:--|:--|',
-    ...rows.map(r => r.split('|').length < 6 ? r.replace(/ \|$/, ' | |') : r), '',
-    `_Each group shares a weekly and a 5-hour limit. This run: ${'${TOKENS}'}._`].join('\n')
+// /usage as a widget: a card with bars and a Refresh button (Bot API 10.4). The refresh tap arrives
+// as a widget_query; we answer at once (15 s limit), read agy's quota, then rewrite the card's state.
+const usageCards = new Map<string, { key: string; state: string; caption: string; running?: boolean }>() // by "chat:message"
+const tokensOf = (key: string): [number, number, number] => { const t = mgr.get(key).tokens; return [t.input, t.output, t.turns] }
+async function sendUsageWidget(ctx: Context, q: Quota): Promise<void> {
+  const key = keyFor(ctx), state = widgetState(q, tokensOf(key)), caption = quotaCaption(q)
+  const m = await (bot.api.raw as any).sendWidget({
+    chat_id: Number(chatId(ctx)), ...threadOpt(dest(ctx)), html: USAGE_HTML, chat_data: state, caption, allow_queries: true,
+  })
+  usageCards.set(`${chatId(ctx)}:${m.message_id}`, { key, state, caption })
 }
-async function tuiCommand(ctx: Context, cmd: string, title: string): Promise<void> {
+async function refreshUsageCard(chat: number, message_id: number, from: string): Promise<void> {
+  const id = `${chat}:${message_id}`
+  const card = usageCards.get(id) ?? { key: keyOf(from, undefined), state: '', caption: '' }
+  usageCards.set(id, card)
+  if (card.running) return // the card updates when the refresh already running lands
+  card.running = true
+  const edit = (chat_data: string) => (bot.api.raw as any).editMessageWidgetData({ chat_id: chat, message_id, chat_data })
+    .catch((e: any) => { if (!/not modified/.test(String(e))) throw e })
+  try {
+    const r = await runTuiCommand('/usage')
+    const q = parseQuota(r.text)
+    if (!q) throw new Error('could not read agy\'s quota screen')
+    card.state = widgetState(q, tokensOf(card.key))
+    await edit(card.state)
+    const caption = quotaCaption(q)
+    if (caption !== card.caption) {
+      card.caption = caption
+      await bot.api.editMessageCaption(chat, message_id, { caption }).catch(() => {})
+    }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    log('usage refresh failed', msg)
+    let prev: any = null
+    try { prev = JSON.parse(card.state) } catch {}
+    await edit(prev?.g ? JSON.stringify({ ...prev, e: msg.slice(0, 200) }) : errorState(msg)).catch(e2 => log('usage card edit failed', e2))
+  } finally { card.running = false }
+}
+bot.use(async (ctx, next) => {
+  const q = (ctx.update as any).widget_query
+  if (!q) return next()
+  const answer = (data?: string) => (bot.api.raw as any).answerWidgetQuery({ widget_query_id: q.id, ...(data ? { data } : {}) }).catch((e: any) => log('answerWidgetQuery', e))
+  const from = String(q.from?.id ?? '')
+  if (!isMember(from)) { await answer('e:Not authorized.'); return }
+  if (q.data !== 'r' || !q.chat || !q.message_id) { await answer('e:Unknown request.'); return }
+  await answer()
+  // Not awaited: grammy handles updates one at a time, and reading the quota takes ~15 s.
+  void refreshUsageCard(q.chat.id, q.message_id, from).catch(e => log('usage refresh', e))
+})
+async function tuiCommand(ctx: Context, cmd: string, title: string, legacy = false): Promise<void> {
   if (!gate(ctx)) return
   void bot.api.sendChatAction(chatId(ctx), 'typing', threadOpt(dest(ctx))).catch(() => {})
   try {
@@ -587,13 +620,18 @@ async function tuiCommand(ctx: Context, cmd: string, title: string): Promise<voi
     const body = r.text.trim() || '(no output)'
     if (cmd === '/usage') {
       const s = sess(ctx)
-      const md = quotaMd(body)
-      if (md) { await sendRich(bot, dest(ctx), md.replace('${TOKENS}', `${s.tokens.input.toLocaleString()} input · ${s.tokens.output.toLocaleString()} output tokens in ${s.tokens.turns} turns`)); return }
+      const q = parseQuota(body)
+      if (q) {
+        if (!legacy && await sendUsageWidget(ctx, q).then(() => true, e => { log('sendWidget failed, sending text', e); return false })) return
+        await sendRich(bot, dest(ctx), quotaMd(q, `${s.tokens.input.toLocaleString()} input · ${s.tokens.output.toLocaleString()} output tokens in ${s.tokens.turns} turns`))
+        return
+      }
     }
     await sendLong(dest(ctx), `**${title}**\n\n${fence(clip(body, 3200, true))}`, body, `${cmd.slice(1)}.txt`)
   } catch (e) { await ctx.reply(`⚠️ ${cmd}: ${e instanceof Error ? e.message : e}`) }
 }
 bot.command(['usage', 'quota'], ctx => tuiCommand(ctx, '/usage', '📊 agy usage'))
+bot.command('legacy_usage', ctx => tuiCommand(ctx, '/usage', '📊 agy usage', true))
 bot.command('credits', ctx => tuiCommand(ctx, '/credits', '💳 agy credits'))
 bot.command('skills', ctx => tuiCommand(ctx, '/skills', '🧠 agy skills'))
 bot.command('tui', async ctx => {
@@ -707,7 +745,7 @@ bot.command('help', async ctx => {
     '**agy settings:** /model · /think (thinking level) · /mode (agent mode + tool permission) · /turbo · /permission ask|turbo|sandbox|strict · /config · /restart',
     '**agy tools:** /mcp · /plugins · /agents · /models · /changelog (add arguments to pass them on, e.g. `/mcp disable github`)',
     '**See what happened:** /screen · /steps · /diff · /status · /sessions · /live',
-    '**agy account:** /usage (quota) · /credits · /skills · /tui <any agy terminal command>',
+    '**agy account:** /usage (quota card; /legacy_usage as text) · /credits · /skills · /tui <any agy terminal command>',
     '**Shell:** `!git status` runs directly on the server',
     `**agy's own commands** (sent to agy as typed): ${agyCmds}`,
     '**Admin:** /invite · /users · /shell on|off · /cleanup (delete saved voice messages, photos and files)',
@@ -932,7 +970,7 @@ const BOT_COMMANDS = [
   ['project', 'Switch folder'], ['newproject', 'Create a project (optionally from a git repo)'], ['steps', 'Steps of the last turn, with outputs'], ['diff', 'Uncommitted changes'],
   ['status', 'Folder, model, mode, chat'], ['sessions', 'Who is running what'], ['topics', 'Your topics (one chat each)'], ['import', 'Make topics from your earlier agy chats'], ['icon', 'Choose the icon for this project\'s topics'], ['mcp', 'agy MCP servers'],
   ['plugins', 'agy plugins'], ['agents', 'agy agents'], ['config', 'agy settings'], ['restart', 'Restart your agy (admin: all, bot, claude)'],
-  ['live', 'Toggle live progress'], ['usage', 'agy quota (5-hour and weekly limits)'], ['screen', 'Terminal-style screenshot'], ['credits', 'agy credits'], ['skills', 'agy skills'], ['users', 'Manage accounts (admin)'],
+  ['live', 'Toggle live progress'], ['usage', 'agy quota (5-hour and weekly limits)'], ['legacy_usage', 'agy quota as text'], ['screen', 'Terminal-style screenshot'], ['credits', 'agy credits'], ['skills', 'agy skills'], ['users', 'Manage accounts (admin)'],
   ['invite', 'Invite another account (admin)'], ['cleanup', 'Delete saved files (admin)'], ['help', 'All commands'],
 ].map(([command, description]) => ({ command: command!, description: description! }))
 const menuSent = new Map<string, string>()
