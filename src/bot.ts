@@ -316,8 +316,30 @@ bot.use(async (ctx, next) => {
 
 bot.command('restart', async ctx => {
   if (!gate(ctx)) return
-  await ctx.reply('♻️ Restarting your agy process (your chat is kept)…')
-  try { await sess(ctx).restart(); await ctx.reply('✅ agy is running again.') } catch (e) { await ctx.reply(`⚠️ ${e instanceof Error ? e.message : e}`) }
+  const what = arg(ctx).toLowerCase()
+  if (what && !isAdmin(uid(ctx))) { await ctx.reply('🔒 Only an admin can restart other sessions or bots. /restart alone restarts your own agy.'); return }
+  if (!what || what === 'me') {
+    await ctx.reply('♻️ Restarting your agy process (your chat is kept)…')
+    try { await sess(ctx).restart(); await ctx.reply('✅ agy is running again.') } catch (e) { await ctx.reply(`⚠️ ${e instanceof Error ? e.message : e}`) }
+  } else if (what === 'all') {
+    const list = mgr.running()
+    await ctx.reply(`♻️ Restarting ${list.length} agy process${list.length === 1 ? '' : 'es'}…`)
+    for (const s of list) await s.restart().catch(e => log('restart', s.account, e))
+    await ctx.reply('✅ Done.')
+  } else if (what === 'bot') {
+    await ctx.reply('♻️ Restarting the Antigravity bot. Back in a few seconds; agy starts again on your next message.')
+    setTimeout(() => process.exit(0), 500) // systemd (Restart=always) starts it again
+  } else if (what === 'claude') {
+    // The Claude bot's router listens on a unix socket; restart every running Claude session.
+    try {
+      const sock = '/root/claude-telegram/run/router.sock'
+      const r: any = await (await fetch('http://router/sessions', { unix: sock } as any)).json()
+      for (const x of r.sessions ?? []) await fetch(`http://router/restart/${x.id}`, { method: 'POST', unix: sock } as any)
+      await ctx.reply(`♻️ Restarting ${r.sessions?.length ?? 0} Claude session(s).`)
+    } catch (e) { await ctx.reply(`⚠️ Couldn't reach the Claude bot's router: ${e instanceof Error ? e.message : e}`) }
+  } else {
+    await ctx.reply('Usage:\n/restart — your agy\nAdmin: /restart all · /restart bot · /restart claude (the Claude bot\'s sessions)')
+  }
 })
 
 bot.command('steps', async ctx => {
@@ -694,7 +716,7 @@ const BOT_COMMANDS = [
   ['model', 'Choose the model'], ['think', 'Thinking level (low/medium/high)'], ['mode', 'Agent mode and tool permission (turbo)'], ['turbo', 'Run commands without asking'],
   ['project', 'Switch folder'], ['newproject', 'Create a project (optionally from a git repo)'], ['steps', 'Steps of the last turn, with outputs'], ['diff', 'Uncommitted changes'],
   ['status', 'Folder, model, mode, chat'], ['sessions', 'Who is running what'], ['mcp', 'agy MCP servers'],
-  ['plugins', 'agy plugins'], ['agents', 'agy agents'], ['config', 'agy settings'], ['restart', 'Restart your agy process'],
+  ['plugins', 'agy plugins'], ['agents', 'agy agents'], ['config', 'agy settings'], ['restart', 'Restart your agy (admin: all, bot, claude)'],
   ['live', 'Toggle live progress'], ['usage', 'agy quota (5-hour and weekly limits)'], ['screen', 'Terminal-style screenshot'], ['credits', 'agy credits'], ['skills', 'agy skills'], ['users', 'Manage accounts (admin)'],
   ['invite', 'Invite another account (admin)'], ['cleanup', 'Delete saved files (admin)'], ['help', 'All commands'],
 ].map(([command, description]) => ({ command: command!, description: description! }))
