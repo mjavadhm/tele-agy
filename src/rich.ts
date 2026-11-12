@@ -39,17 +39,24 @@ export function chunk(text: string, limit: number, mode: 'length' | 'newline'): 
   return out
 }
 
+/** Where a message goes: a chat, and optionally one topic in it. */
+export type Dest = { chat_id: string; thread?: number }
+export const threadOpt = (d: Dest | string) => typeof d !== 'string' && d.thread ? { message_thread_id: d.thread } : {}
+const chatOf = (d: Dest | string) => typeof d === 'string' ? d : d.chat_id
+
 export async function sendRich(
   bot: Bot,
-  chat_id: string,
+  dest: Dest | string,
   md: string,
   opts: { reply_to?: number; reply_markup?: InlineKeyboard } = {},
 ): Promise<number[]> {
   const ids: number[] = []
+  const chat_id = chatOf(dest)
   const parts = chunk(md, RICH_LIMIT, 'newline')
   for (let i = 0; i < parts.length; i++) {
     const last = i === parts.length - 1
     const extra = {
+      ...threadOpt(dest),
       ...(i === 0 && opts.reply_to != null ? { reply_parameters: { message_id: opts.reply_to } } : {}),
       ...(last && opts.reply_markup ? { reply_markup: opts.reply_markup } : {}),
     }
@@ -61,6 +68,7 @@ export async function sendRich(
       const plain = chunk(parts[i]!, MAX_CHUNK_LIMIT, 'newline')
       for (let j = 0; j < plain.length; j++) {
         const m = await bot.api.sendMessage(chat_id, plain[j]!, {
+          ...threadOpt(dest),
           ...(i === 0 && j === 0 && opts.reply_to != null ? { reply_parameters: { message_id: opts.reply_to } } : {}),
           ...(last && j === plain.length - 1 && opts.reply_markup ? { reply_markup: opts.reply_markup } : {}),
         })
@@ -71,9 +79,9 @@ export async function sendRich(
   return ids
 }
 
-export async function sendDraft(bot: Bot, chat_id: string, draft_id: number, md: string): Promise<void> {
+export async function sendDraft(bot: Bot, dest: Dest, draft_id: number, md: string): Promise<void> {
   await (bot.api.raw as any).sendRichMessageDraft({
-    chat_id: Number(chat_id), draft_id, rich_message: { markdown: richEscape(md) }, can_stop: true,
+    chat_id: Number(dest.chat_id), ...threadOpt(dest), draft_id, rich_message: { markdown: richEscape(md) }, can_stop: true,
   })
 }
 

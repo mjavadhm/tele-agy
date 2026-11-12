@@ -1,5 +1,5 @@
 // Persistent state in ./data (gitignored): shared bot state and one file per account.
-import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs'
+import { readFileSync, writeFileSync, mkdirSync, renameSync, readdirSync, rmSync } from 'fs'
 import { join } from 'path'
 
 export const ROOT = join(import.meta.dir, '..')
@@ -21,6 +21,9 @@ export type AccountState = {
   mode?: string
   permission?: string // agy toolPermission: request-review | always-proceed (turbo) | proceed-in-sandbox | strict-mode
   live?: boolean
+  title?: string // agy's title of the open chat
+  topicName?: string // the Telegram topic's name as we last set it
+  manualName?: boolean // the user renamed the topic; don't rename it again
 }
 
 function readJson<T>(path: string, d: T): T {
@@ -37,12 +40,34 @@ export const loadShared = (): Shared => readJson<Shared>(SHARED, {})
 export const saveShared = (s: Shared) => writeJson(SHARED, s)
 
 export const DEFAULT_CWD = process.env.DEFAULT_CWD ?? process.env.HOME ?? '/root'
-const accPath = (id: string) => join(DATA, 'accounts', `${id}.json`)
-export const loadAccount = (id: string): AccountState => readJson<AccountState>(accPath(id), { cwd: DEFAULT_CWD, live: true })
-export function saveAccount(id: string, patch: Partial<AccountState>): AccountState {
-  const s = { ...loadAccount(id), ...patch }
-  writeJson(accPath(id), s)
+// A session key is "<account>" (the chat outside any topic) or "<account>:<thread>" (one topic).
+export const keyOf = (account: string, thread?: number) => thread ? `${account}:${thread}` : account
+export const splitKey = (key: string): { account: string; thread?: number } => {
+  const [account, th] = key.split(':')
+  return { account: account!, thread: th ? Number(th) : undefined }
+}
+const accPath = (key: string) => join(DATA, 'accounts', `${key.replace(':', '.t')}.json`)
+export function loadAccount(key: string): AccountState {
+  const { account, thread } = splitKey(key)
+  if (!thread) return readJson<AccountState>(accPath(key), { cwd: DEFAULT_CWD, live: true })
+  // A topic starts from the account's folder and preferences, with its own chat.
+  const { sessionId: _s, title: _t, topicName: _n, manualName: _m, ...base } = loadAccount(account)
+  return readJson<AccountState>(accPath(key), base)
+}
+export function saveAccount(key: string, patch: Partial<AccountState>): AccountState {
+  const s = { ...loadAccount(key), ...patch }
+  writeJson(accPath(key), s)
   return s
+}
+export function deleteAccount(key: string): void { try { rmSync(accPath(key)) } catch {} }
+/** Keys of the topics this account has saved state for. */
+export function topicKeys(account: string): string[] {
+  try {
+    return readdirSync(join(DATA, 'accounts'))
+      .map(f => new RegExp(`^${account}\\.t(\\d+)\\.json$`).exec(f)?.[1])
+      .filter((x): x is string => Boolean(x))
+      .map(th => `${account}:${th}`)
+  } catch { return [] }
 }
 
 export function adminIds(): string[] {

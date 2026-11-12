@@ -1,12 +1,12 @@
-// One agy ACP process + session per Telegram account. Streams each turn into a live Telegram
+// One agy ACP process + session per Telegram account, or per topic when the bot has topics on. Streams each turn into a live Telegram
 // draft (reply text, thinking, tool steps, plan) and sends the final answer as a rich message.
 import { Bot, InlineKeyboard } from 'grammy'
 import { randomBytes } from 'crypto'
 import { Acp, type PermissionRequest, type SessionUpdate } from './acp.ts'
-import { sendRich, sendDraft, fence, clip } from './rich.ts'
+import { sendRich, sendDraft, fence, clip, threadOpt, type Dest } from './rich.ts'
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs'
 import { join } from 'path'
-import { loadAccount, saveAccount, loadShared, DEFAULT_CWD, type AccountState } from './store.ts'
+import { loadAccount, saveAccount, loadShared, splitKey, DEFAULT_CWD, type AccountState } from './store.ts'
 
 export const AGY_BIN = process.env.AGY_BIN ?? `${process.env.HOME ?? '/root'}/.local/bin/agy`
 export const AGY_SETTINGS = join(process.env.HOME ?? '/root', '.gemini', 'antigravity-cli', 'settings.json')
@@ -37,7 +37,6 @@ export type Command = { name: string; description: string }
 
 type Turn = {
   prompt: string
-  chat_id: string
   draftId: number
   started: number
   text: string
@@ -50,7 +49,7 @@ type Turn = {
   lastDraftAt: number
   timer: ReturnType<typeof setInterval>
 }
-type Queued = { chat_id: string; blocks: any[] }
+type Queued = { blocks: any[] }
 
 const log = (...a: unknown[]) => console.error(new Date().toISOString(), ...a)
 
@@ -117,14 +116,25 @@ export class AgentSession {
   tokens = { input: 0, output: 0, turns: 0 }
   private starting: Promise<void> | null = null
   private replaying = false
-  private replay = { user: '', agent: '' }
+  replay = { user: '', agent: '' } // last exchange of the chat that was loaded most recently
   private permissions = new Map<string, { resolve: (id: string | null) => void; options: PermissionRequest['options']; chat_id: string; message_id?: number; text: string }>()
   onCommands: (s: AgentSession) => void = () => {}
+  /** The chat's folder or title changed (the topic name follows them). */
+  onRename: (s: AgentSession) => void = () => {}
+  /** Telegram account (= private chat id) and, for a topic session, its thread id. */
+  readonly account: string
+  readonly thread?: number
+  readonly dest: Dest
 
-  constructor(readonly account: string, private bot: Bot, private mgr: SessionManager) {}
+  constructor(readonly key: string, private bot: Bot, private mgr: SessionManager) {
+    const k = splitKey(key)
+    this.account = k.account
+    this.thread = k.thread
+    this.dest = { chat_id: k.account, thread: k.thread }
+  }
 
   get busy(): boolean { return this.turn !== null }
-  get state(): AccountState { return loadAccount(this.account) }
+  get state(): AccountState { return loadAccount(this.key) }
   get running(): boolean { return Boolean(this.acp?.running) }
   configValue(id: string): string { return this.config.find(c => c.id === id)?.currentValue ?? '' }
 
@@ -140,11 +150,11 @@ export class AgentSession {
     const st = this.state
     const cwd = existsSync(st.cwd) ? st.cwd : DEFAULT_CWD
     writeToolPermission(st.permission ?? 'request-review')
-    const acp = new Acp(AGY_BIN, [], s => log(`[${this.account}]`, s), cwd)
+    const acp = new Acp(AGY_BIN, [], s => log(`[${this.key}]`, s), cwd)
     acp.onUpdate = (sid, u) => this.onUpdate(sid, u)
     acp.onPermission = p => this.askPermission(p)
     acp.onExit = code => {
-      log(`[${this.account}] agy exited (${code})`)
+      log(`[${this.key}] agy exited (${code})`)
       this.acp = null
       this.sessionId = ''
       this.cancelPermissions()
@@ -152,23 +162,24 @@ export class AgentSession {
     }
     this.acp = acp
     await acp.start()
-    log(`[${this.account}] agy acp started (pid ${acp.pid})`)
-    await this.open(st.sessionId, cwd)
+    log(`[${this.key}] agy acp started (pid ${acp.pid})`)
+    await this.open(st.sessionId, cwd, st.title)
   }
 
   /** Open an existing chat (load) or start a new one in `cwd`. Returns the last exchange of a loaded chat. */
-  async open(sessionId: string | undefined, cwd: string): Promise<{ user: string; agent: string } | null> {
+  async open(sessionId: string | undefined, cwd: string, title = ''): Promise<{ user: string; agent: string } | null> {
     if (this.acp && this.acp.cwd !== cwd) {
       // Different folder: restart agy there (its tools work in the process folder).
-      saveAccount(this.account, { cwd, sessionId: sessionId ?? '' })
+      saveAccount(this.key, { cwd, sessionId: sessionId ?? '', title })
       this.stop()
-      if (!sessionId) saveAccount(this.account, { sessionId: undefined })
+      if (!sessionId) saveAccount(this.key, { sessionId: undefined })
       await this.ensure()
       return sessionId ? { ...this.replay } : null
     }
     const acp = this.acp!
     let res: any = null
     let loaded = false
+    this.title = title // a title agy reports while loading replaces it
     if (sessionId) {
       this.replaying = true
       this.replay = { user: '', agent: '' }
@@ -176,7 +187,7 @@ export class AgentSession {
         res = await acp.request('session/load', { sessionId, cwd, mcpServers: [] })
         loaded = true
       } catch (e) {
-        log(`[${this.account}] load ${sessionId} failed: ${e}`)
+        log(`[${this.key}] load ${sessionId} failed: ${e}`)
       } finally { this.replaying = false }
     }
     if (!loaded) {
@@ -187,7 +198,8 @@ export class AgentSession {
     this.sessionId = sessionId!
     this.cwd = cwd
     if (res?.configOptions) this.config = res.configOptions
-    saveAccount(this.account, { sessionId: this.sessionId, cwd })
+    saveAccount(this.key, { sessionId: this.sessionId, cwd, title: this.title })
+    this.onRename(this)
     await this.applyPrefs()
     return loaded ? { ...this.replay } : null
   }
@@ -197,7 +209,7 @@ export class AgentSession {
     const st = this.state
     for (const [id, want] of [['model', st.model], ['thought_level', st.thought], ['mode', st.mode]] as const) {
       if (want && this.configValue(id) && this.configValue(id) !== want) {
-        await this.setConfig(id, want).catch(e => log(`[${this.account}] set ${id}=${want}: ${e}`))
+        await this.setConfig(id, want).catch(e => log(`[${this.key}] set ${id}=${want}: ${e}`))
       }
     }
   }
@@ -206,7 +218,7 @@ export class AgentSession {
     const r: any = await this.acp!.request('session/set_config_option', { sessionId: this.sessionId, configId: id, value })
     if (r?.configOptions) this.config = r.configOptions
     const key = id === 'thought_level' ? 'thought' : id
-    saveAccount(this.account, { [key]: value } as any)
+    saveAccount(this.key, { [key]: value } as any)
   }
 
   async newChat(cwd?: string): Promise<void> {
@@ -234,16 +246,16 @@ export class AgentSession {
   }
 
   // --- turns -----------------------------------------------------------------
-  async prompt(chat_id: string, blocks: any[]): Promise<void> {
+  async prompt(blocks: any[]): Promise<void> {
     this.lastUsed = Date.now()
     if (this.turn || this.starting) {
-      this.queue.push({ chat_id, blocks })
-      if (this.turn) await this.bot.api.sendMessage(chat_id, `⏳ Queued (${this.queue.length}). agy is still working; it runs next. /stop cancels the current turn.`).catch(() => {})
+      this.queue.push({ blocks })
+      if (this.turn) await this.bot.api.sendMessage(this.account, `⏳ Queued (${this.queue.length}). agy is still working; it runs next. /stop cancels the current turn.`, threadOpt(this.dest)).catch(() => {})
       if (this.turn) return
       await this.starting
       return this.drain()
     }
-    this.queue.push({ chat_id, blocks })
+    this.queue.push({ blocks })
     return this.drain()
   }
 
@@ -252,11 +264,11 @@ export class AgentSession {
       const q = this.queue.shift()!
       try {
         if (!this.running || !this.sessionId) {
-          await this.bot.api.sendChatAction(q.chat_id, 'typing').catch(() => {})
+          await this.bot.api.sendChatAction(this.account, 'typing', threadOpt(this.dest)).catch(() => {})
           await this.ensure()
         }
       } catch (e) {
-        await this.bot.api.sendMessage(q.chat_id, `⚠️ Couldn't start agy: ${e instanceof Error ? e.message : e}`).catch(() => {})
+        await this.bot.api.sendMessage(this.account, `⚠️ Couldn't start agy: ${e instanceof Error ? e.message : e}`, threadOpt(this.dest)).catch(() => {})
         continue
       }
       await this.runTurn(q)
@@ -266,7 +278,7 @@ export class AgentSession {
   private async runTurn(q: Queued): Promise<void> {
     const t: Turn = {
       prompt: q.blocks.map(b => b.type === 'text' ? b.text : b.type === 'image' ? '[image]' : '').join(' ').trim(),
-      chat_id: q.chat_id, draftId: 1 + Math.floor(Math.random() * 2_000_000_000), started: Date.now(),
+      draftId: 1 + Math.floor(Math.random() * 2_000_000_000), started: Date.now(),
       text: '', thought: '', thinking: true, steps: [], stepById: new Map(), plan: [], lastDraft: '', lastDraftAt: 0,
       timer: setInterval(() => void this.pushDraft(), DRAFT_EVERY_MS),
     }
@@ -306,7 +318,7 @@ export class AgentSession {
     if (note) parts.push(note)
     if (!parts.length) parts.push('_(agy finished without a text reply)_')
     parts.push(`<sub>${meta.join(' · ')}</sub>`)
-    await sendRich(this.bot, t.chat_id, parts.join('\n\n')).catch(e => log('final send failed', e))
+    await sendRich(this.bot, this.dest, parts.join('\n\n')).catch(e => log('final send failed', e))
     void this.drain()
   }
 
@@ -343,7 +355,7 @@ export class AgentSession {
     if (!force && md === t.lastDraft && now - t.lastDraftAt < DRAFT_REFRESH_MS) return
     t.lastDraft = md
     t.lastDraftAt = now
-    try { await sendDraft(this.bot, t.chat_id, t.draftId, md) } catch (e) {
+    try { await sendDraft(this.bot, this.dest, t.draftId, md) } catch (e) {
       const msg = String(e)
       log('draft failed', msg)
       if (/not found|unknown method/i.test(msg)) this.mgr.liveBroken = true
@@ -356,7 +368,10 @@ export class AgentSession {
     const kind = u.sessionUpdate
     if (kind === 'available_commands_update') { this.commands = u.availableCommands ?? []; this.onCommands(this); return }
     if (kind === 'config_option_update') { if (u.configOptions) this.config = u.configOptions; return }
-    if (kind === 'session_info_update') { if (u.title) this.title = u.title; return }
+    if (kind === 'session_info_update') {
+      if (u.title && u.title !== this.title) { this.title = u.title; saveAccount(this.key, { title: u.title }); this.onRename(this) }
+      return
+    }
     if (kind === 'current_mode_update') {
       const m = this.config.find(c => c.id === 'mode')
       if (m && u.currentModeId) m.currentValue = u.currentModeId
@@ -405,7 +420,7 @@ export class AgentSession {
   }
 
   private async askPermission(p: PermissionRequest): Promise<string | null> {
-    const chat_id = this.turn?.chat_id ?? this.account
+    const chat_id = this.account
     const tc = p.toolCall ?? ({} as any)
     const key = randomBytes(3).toString('hex')
     const input = stepInput(tc)
@@ -415,7 +430,7 @@ export class AgentSession {
     return new Promise<string | null>(resolve => {
       const entry: { resolve: (id: string | null) => void; options: PermissionRequest['options']; chat_id: string; message_id?: number; text: string } = { resolve, options: p.options, chat_id, text }
       this.permissions.set(key, entry)
-      void sendRich(this.bot, chat_id, text, { reply_markup: kb }).then(ids => { entry.message_id = ids.at(-1) }).catch(() => {})
+      void sendRich(this.bot, this.dest, text, { reply_markup: kb }).then(ids => { entry.message_id = ids.at(-1) }).catch(() => {})
     })
   }
 
@@ -443,17 +458,26 @@ export class SessionManager {
   sessions = new Map<string, AgentSession>()
   liveBroken = false
   onCommands: (s: AgentSession) => void = () => {}
+  onRename: (s: AgentSession) => void = () => {}
   constructor(private bot: Bot) {}
 
-  get(account: string): AgentSession {
-    let s = this.sessions.get(account)
+  /** `key` is "<account>" or "<account>:<thread>" (see store.keyOf). */
+  get(key: string): AgentSession {
+    let s = this.sessions.get(key)
     if (!s) {
-      s = new AgentSession(account, this.bot, this)
+      s = new AgentSession(key, this.bot, this)
       s.onCommands = x => this.onCommands(x)
-      this.sessions.set(account, s)
+      s.onRename = x => this.onRename(x)
+      this.sessions.set(key, s)
     }
     return s
   }
+  /** Stop and forget a session (its topic was deleted, or its account removed). */
+  drop(key: string): void {
+    this.sessions.get(key)?.stop()
+    this.sessions.delete(key)
+  }
+  ofAccount(account: string): AgentSession[] { return [...this.sessions.values()].filter(s => s.account === account) }
   maxSessions(): number { return Math.max(1, Number(loadShared().maxSessions ?? process.env.MAX_SESSIONS ?? 3) || 3) }
   running(): AgentSession[] { return [...this.sessions.values()].filter(s => s.running) }
 
@@ -463,13 +487,13 @@ export class SessionManager {
     if (live.length < this.maxSessions()) return
     const idle = live.filter(s => !s.busy).sort((a, b) => a.lastUsed - b.lastUsed)
     if (!idle.length) throw new Error(`all ${this.maxSessions()} agy sessions are busy right now; try again in a few minutes`)
-    log(`stopping idle session of ${idle[0]!.account} to make room`)
+    log(`stopping idle session of ${idle[0]!.key} to make room`)
     idle[0]!.stop()
   }
 
-  /** Which other account has this chat open? */
+  /** Which other running session (by key) has this chat open? */
   ownerOf(sessionId: string, except: string): string | null {
-    for (const s of this.sessions.values()) if (s.account !== except && s.running && s.sessionId === sessionId) return s.account
+    for (const s of this.sessions.values()) if (s.key !== except && s.running && s.sessionId === sessionId) return s.key
     return null
   }
 }

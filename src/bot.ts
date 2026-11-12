@@ -1,19 +1,19 @@
 // agy-telegram: use Google's Antigravity CLI (agy) from Telegram.
 // Each allowed account gets its own `agy acp` process and chat (like separate terminals on the
-// same machine). Replies stream live; tool steps, plans and permission prompts appear in Telegram.
+// same machine). With topics turned on for the bot, each topic is its own chat. Replies stream live; tool steps, plans and permission prompts appear in Telegram.
 import { Bot, InlineKeyboard, InputFile, type Context } from 'grammy'
 import { execFile } from 'child_process'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, realpathSync, appendFileSync, existsSync } from 'fs'
 import { join, basename } from 'path'
 import { randomBytes } from 'crypto'
 import { homedir } from 'os'
-import { sendRich, fence, clip } from './rich.ts'
+import { sendRich, fence, clip, threadOpt, type Dest } from './rich.ts'
 import { SessionManager, AgentSession, stepsMd, AGY_BIN, PERMISSIONS, screenAnsi } from './session.ts'
 import { runTuiCommand } from './tui.ts'
 import { scan, older, remove, human, summary } from './cleanup.ts'
 import { parseArgs, createProject, NEWPROJECT_HELP, PROJECTS_BASE } from './newproject.ts'
 import {
-  DATA, ROOT, loadShared, saveShared, loadAccount, saveAccount, adminIds, isAdmin, isMember, memberIds,
+  DATA, ROOT, loadShared, saveShared, loadAccount, saveAccount, deleteAccount, topicKeys, keyOf, adminIds, isAdmin, isMember, memberIds,
 } from './store.ts'
 
 // --- config --------------------------------------------------------------------
@@ -38,10 +38,16 @@ const log = (...a: unknown[]) => console.error(new Date().toISOString(), ...a)
 const bot = new Bot(TOKEN)
 const mgr = new SessionManager(bot)
 let botUsername = ''
+let topicsOn = false // forum topic mode in private chats (a @BotFather setting), read from getMe
 
 // --- helpers ---------------------------------------------------------------------
 const uid = (ctx: Context) => String(ctx.from?.id ?? '')
 const chatId = (ctx: Context) => String(ctx.chat?.id ?? '')
+/** The topic a message or pressed button belongs to, if any. */
+const threadOf = (ctx: Context): number | undefined => ctx.msg?.is_topic_message ? ctx.msg.message_thread_id : undefined
+const keyFor = (ctx: Context) => keyOf(uid(ctx), threadOf(ctx))
+const dest = (ctx: Context): Dest => ({ chat_id: chatId(ctx), thread: threadOf(ctx) })
+const topicLink = (thread: number) => `https://t.me/${botUsername}/${thread}`
 const arg = (ctx: Context) => String(ctx.match ?? '').trim()
 const isPrivate = (ctx: Context) => ctx.chat?.type === 'private'
 function displayName(from: Context['from']): string {
@@ -68,13 +74,13 @@ function ago(ms: number): string {
   if (s < 129600) return `${Math.round(s / 3600)}h ago`
   return `${Math.round(s / 86400)}d ago`
 }
-async function sendLong(chat_id: string, md: string, full: string, filename: string): Promise<void> {
-  await sendRich(bot, chat_id, md)
+async function sendLong(d: Dest, md: string, full: string, filename: string): Promise<void> {
+  await sendRich(bot, d, md)
   if (full.length <= 3200) return
   mkdirSync(OUT, { recursive: true })
   const path = join(OUT, `${Date.now()}-${filename}`)
   writeFileSync(path, full)
-  await bot.api.sendDocument(chat_id, new InputFile(path, filename)).catch(() => {})
+  await bot.api.sendDocument(d.chat_id, new InputFile(path, filename), threadOpt(d)).catch(() => {})
 }
 function run(cmd: string, args: string[], cwd: string, timeout = 120_000): Promise<{ code: number; out: string }> {
   return new Promise(resolve => {
@@ -84,7 +90,7 @@ function run(cmd: string, args: string[], cwd: string, timeout = 120_000): Promi
     })
   })
 }
-const sess = (ctx: Context) => mgr.get(uid(ctx))
+const sess = (ctx: Context) => mgr.get(keyFor(ctx))
 function modelName(s: AgentSession): string {
   const m = s.config.find(c => c.id === 'model')
   return m?.options.find(o => o.value === m.currentValue)?.name ?? (s.state.model || 'default')
@@ -143,35 +149,109 @@ function usersView(): { md: string; kb: InlineKeyboard } {
 bot.command('users', async ctx => {
   if (!adminGate(ctx)) return
   const v = usersView()
-  await sendRich(bot, chatId(ctx), v.md, { reply_markup: v.kb })
+  await sendRich(bot, dest(ctx), v.md, { reply_markup: v.kb })
+})
+
+// --- topics: one chat per topic ---------------------------------------------------
+// Topic names are "<project folder> - <chat title>"; the title comes from agy after the first reply.
+const topicName = (cwd: string, title?: string) => clip(`${basename(cwd) || cwd} - ${title?.trim() || 'new chat'}`, 120)
+mgr.onRename = s => {
+  if (!s.thread) return
+  const st = s.state
+  if (st.manualName) return
+  const name = topicName(s.cwd || st.cwd, s.title)
+  if (st.topicName === name) return
+  saveAccount(s.key, { topicName: name })
+  void bot.api.editForumTopic(Number(s.account), s.thread, { name }).catch(e => log(`rename topic ${s.key}: ${e}`))
+}
+/** The key (main chat or topic) of this account that holds the given agy chat, if any. */
+function boundKey(account: string, sessionId: string): string | null {
+  for (const k of [account, ...topicKeys(account)]) if (loadAccount(k).sessionId === sessionId) return k
+  return null
+}
+const whereIs = (key: string) => {
+  const th = Number(key.split(':')[1] ?? 0)
+  return th ? `the topic “${loadAccount(key).topicName ?? th}”: ${topicLink(th)}` : 'the main chat (outside topics)'
+}
+/** Create a topic for a new chat in `cwd`, or for an existing agy chat. */
+async function openTopic(ctx: Context, cwd: string, chat?: { sessionId: string; title?: string }): Promise<void> {
+  const account = uid(ctx)
+  const from = loadAccount(keyFor(ctx))
+  const name = topicName(cwd, chat?.title)
+  const t = await bot.api.createForumTopic(Number(account), name)
+  const thread = t.message_thread_id
+  const key = keyOf(account, thread)
+  saveAccount(key, {
+    cwd, sessionId: chat?.sessionId, title: chat?.title, topicName: name,
+    model: from.model, thought: from.thought, mode: from.mode, permission: from.permission, live: from.live,
+  })
+  const d: Dest = { chat_id: account, thread }
+  if (!chat) await sendRich(bot, d, `🆕 **New chat** in \`${cwd}\`\nSend a message here to start. agy starts on your first message.`)
+  else {
+    // Start agy now so the topic shows where the chat left off.
+    try {
+      const s = mgr.get(key)
+      await s.ensure()
+      const last = s.replay
+      const prev = last.user || last.agent
+        ? `\n\n**Last exchange**\n\n> **You:** ${clip(last.user.trim().replace(/\n+/g, ' '), 400)}\n\n**agy:** ${clip(last.agent.trim(), 1500)}` : ''
+      await sendRich(bot, d, `↩️ **Resumed:** ${chat.title || chat.sessionId}\n📁 \`${cwd}\`${prev}`)
+    } catch (e) {
+      await sendRich(bot, d, `↩️ **${chat.title || chat.sessionId}**\n📁 \`${cwd}\`\n\n⚠️ ${e instanceof Error ? e.message : e}\nThe chat opens on your next message here.`)
+    }
+  }
+  await ctx.reply(`➡️ Opened in a new topic: ${name}\n${topicLink(thread)}`)
+}
+bot.command('topics', async ctx => {
+  if (!gate(ctx)) return
+  if (!topicsOn) { await ctx.reply('Topics are off for this bot. Turn on topic mode for it in @BotFather, then /restart bot.'); return }
+  const keys = topicKeys(uid(ctx))
+  if (!keys.length) { await ctx.reply('No topics yet. /new, /resume, /project and /newproject each open one, or create a topic yourself and write in it.'); return }
+  const lines = ['## 🗂 Your topics', '']
+  const kb = new InlineKeyboard()
+  for (const k of keys) {
+    const st = loadAccount(k)
+    const th = Number(k.split(':')[1])
+    const s = mgr.sessions.get(k)
+    const name = st.topicName ?? `topic ${th}`
+    lines.push(`- [${name}](${topicLink(th)}) · ${s?.running ? (s.busy ? '⏳ working' : '🟢 idle') : '⚪ stopped'}  \n  📁 \`${st.cwd}\``)
+    kb.text(clip(`🗑 ${name}`, 60), `td:${th}`).row()
+  }
+  lines.push('', '_🗑 deletes the topic and its messages in Telegram. The agy chat itself is kept and /resume can open it again._')
+  await sendRich(bot, dest(ctx), lines.join('\n'), { reply_markup: kb })
 })
 
 // --- session commands ------------------------------------------------------------
 bot.command('new', async ctx => {
   if (!gate(ctx)) return
   const s = sess(ctx)
-  if (s.busy) { await ctx.reply('⏳ agy is working. /stop first, then /new.'); return }
-  try { await s.newChat(); await ctx.reply(`🆕 New chat in ${s.cwd}`) } catch (e) { await ctx.reply(`⚠️ ${e instanceof Error ? e.message : e}`) }
+  try {
+    if (topicsOn) { await openTopic(ctx, s.cwd || s.state.cwd); return }
+    if (s.busy) { await ctx.reply('⏳ agy is working. /stop first, then /new.'); return }
+    await s.newChat(); await ctx.reply(`🆕 New chat in ${s.cwd}`)
+  } catch (e) { await ctx.reply(`⚠️ ${e instanceof Error ? e.message : e}`) }
 })
 
 let resumeLists = new Map<string, { sessionId: string; cwd: string; title?: string }[]>()
 bot.command('resume', async ctx => {
   if (!gate(ctx)) return
   const s = sess(ctx)
-  if (s.busy) { await ctx.reply('⏳ agy is working. /stop first, then /resume.'); return }
+  if (s.busy && !topicsOn) { await ctx.reply('⏳ agy is working. /stop first, then /resume.'); return }
   let list: { sessionId: string; cwd: string; title?: string; updatedAt?: string }[]
   try { list = await s.listChats() } catch (e) { await ctx.reply(`⚠️ ${e instanceof Error ? e.message : e}`); return }
   const all = arg(ctx) === 'all'
   list = list.filter(x => all || x.cwd === s.cwd).slice(0, 15)
+  const me = uid(ctx)
   if (!list.length) { await ctx.reply(`No saved chats in ${s.cwd}. Send /resume all for every folder.`); return }
   resumeLists.set(uid(ctx), list)
   const kb = new InlineKeyboard()
   list.forEach((x, i) => {
-    const mark = x.sessionId === s.sessionId ? '• ' : mgr.ownerOf(x.sessionId, uid(ctx)) ? '🔒 ' : ''
+    const owner = mgr.ownerOf(x.sessionId, s.key)
+    const mark = x.sessionId === s.sessionId ? '• ' : owner && owner.split(':')[0] !== me ? '🔒 ' : boundKey(me, x.sessionId) ? '📌 ' : ''
     const when = x.updatedAt ? ` · ${ago(Date.parse(x.updatedAt))}` : ''
     kb.text(clip(`${mark}${x.title || '(untitled)'}${all ? ` · ${basename(x.cwd)}` : ''}${when}`, 60), `rs:${i}`).row()
   })
-  await ctx.reply(`Recent chats ${all ? '(all folders)' : `in ${s.cwd}`}:\n• = current · 🔒 = open in another account`, { reply_markup: kb })
+  await ctx.reply(`Recent chats ${all ? '(all folders)' : `in ${s.cwd}`}:\n• = current · 🔒 = open in another account${topicsOn ? ' · 📌 = already in one of your topics\nPicking one opens it in its own topic.' : ''}`, { reply_markup: kb })
 })
 
 bot.command('model', async ctx => {
@@ -222,7 +302,7 @@ bot.command('mode', async ctx => {
   kb.row()
   PERMISSIONS.forEach((p, i) => { kb.text(`${p.value === perm ? '• ' : ''}${p.label}`, `tp:${i}`); if (i % 2) kb.row() })
   const modeName = c?.options.find(o => o.value === c.currentValue)?.name ?? 'Default'
-  await sendRich(bot, chatId(ctx), [
+  await sendRich(bot, dest(ctx), [
     `**Agent mode:** ${modeName} · **Tool permission:** ${PERMISSIONS.find(p => p.value === perm)?.label ?? perm}`, '',
     '**Agent mode** (first row): *Default* asks per your tool permission · *Accept edits* approves file edits · *Plan* researches and plans without changes.',
     '**Tool permission** (agy\'s setting): *Ask me* · *Turbo* runs every command without asking · *Sandbox* runs commands in a restricted sandbox · *Strict* read-only. Changing it restarts your agy (chat kept).',
@@ -240,7 +320,7 @@ async function setPermission(ctx: Context, value: string): Promise<void> {
   const p = PERMISSIONS.find(x => x.value === value)!
   if ((s.state.permission ?? 'request-review') === value) { await ctx.reply(`Already: ${p.label}`); return }
   if (s.busy) { await ctx.reply('⏳ agy is working. /stop first.'); return }
-  saveAccount(uid(ctx), { permission: value })
+  saveAccount(keyFor(ctx), { permission: value })
   await ctx.reply(`${p.label}: restarting your agy (chat kept)…`)
   try { await s.restart(); await ctx.reply(`✅ Tool permission: ${p.label}`) } catch (e) { await ctx.reply(`⚠️ ${e instanceof Error ? e.message : e}`) }
 }
@@ -261,6 +341,10 @@ function listProjects(): string[] {
 let projectLists = new Map<string, string[]>()
 async function switchProject(ctx: Context, dir: string): Promise<void> {
   const s = sess(ctx)
+  if (topicsOn) {
+    try { await openTopic(ctx, dir) } catch (e) { await ctx.reply(`⚠️ ${e instanceof Error ? e.message : e}`) }
+    return
+  }
   if (s.busy) { await ctx.reply('⏳ agy is working. /stop first.'); return }
   try {
     await s.ensure()
@@ -280,7 +364,7 @@ bot.command('project', async ctx => {
   }
   const list = listProjects()
   projectLists.set(uid(ctx), list)
-  const cur = sess(ctx).cwd || loadAccount(uid(ctx)).cwd
+  const cur = sess(ctx).cwd || loadAccount(keyFor(ctx)).cwd
   const kb = new InlineKeyboard()
   list.forEach((p, i) => kb.text(`${p === cur ? '• ' : ''}${p}`, `pj:${i}`).row())
   await ctx.reply(`Current folder: ${cur}\nPick one, or send /project <path>:`, { reply_markup: kb })
@@ -289,13 +373,13 @@ bot.command('project', async ctx => {
 bot.command('newproject', async ctx => {
   if (!gate(ctx)) return
   const a = parseArgs(arg(ctx))
-  if (a === 'usage') { await sendRich(bot, chatId(ctx), NEWPROJECT_HELP); return }
+  if (a === 'usage') { await sendRich(bot, dest(ctx), NEWPROJECT_HELP); return }
   if (typeof a === 'string') { await ctx.reply(a); return }
-  if (sess(ctx).busy) { await ctx.reply('⏳ agy is working. /stop first.'); return }
-  void bot.api.sendChatAction(chatId(ctx), 'typing').catch(() => {})
+  if (sess(ctx).busy && !topicsOn) { await ctx.reply('⏳ agy is working. /stop first.'); return }
+  void bot.api.sendChatAction(chatId(ctx), 'typing', threadOpt(dest(ctx))).catch(() => {})
   try {
     const p = await createProject(a.target, a.remote)
-    await sendRich(bot, chatId(ctx), `📁 **${p.dir}**\n${p.report}`)
+    await sendRich(bot, dest(ctx), `📁 **${p.dir}**\n${p.report}`)
     await switchProject(ctx, p.dir)
   } catch (e) { await ctx.reply(`⚠️ ${e instanceof Error ? e.message : e}`) }
 })
@@ -311,7 +395,7 @@ bot.use(async (ctx, next) => {
   if (!st) return next()
   const id = String(st.chat?.id ?? '')
   if (!isMember(id)) return
-  await mgr.get(id).cancel()
+  await mgr.get(keyOf(id, st.message_thread_id)).cancel()
 })
 
 bot.command('restart', async ctx => {
@@ -324,7 +408,7 @@ bot.command('restart', async ctx => {
   } else if (what === 'all') {
     const list = mgr.running()
     await ctx.reply(`♻️ Restarting ${list.length} agy process${list.length === 1 ? '' : 'es'}…`)
-    for (const s of list) await s.restart().catch(e => log('restart', s.account, e))
+    for (const s of list) await s.restart().catch(e => log('restart', s.key, e))
     await ctx.reply('✅ Done.')
   } else if (what === 'bot') {
     await ctx.reply('♻️ Restarting the Antigravity bot. Back in a few seconds; agy starts again on your next message.')
@@ -350,30 +434,30 @@ bot.command('steps', async ctx => {
   const shown = steps.slice(-30)
   const md = `**🔧 ${s.turn ? 'Current' : 'Last'} turn: ${steps.length} step${steps.length > 1 ? 's' : ''}** · tap one to open\n\n${stepsMd(shown, 25000, steps.length - shown.length)}`
   const full = steps.map((st, i) => `#${i + 1} ${st.label} [${st.status}]\n--- input ---\n${st.input}\n--- output ---\n${st.output ?? '(running…)'}\n`).join('\n')
-  await sendRich(bot, chatId(ctx), md)
+  await sendRich(bot, dest(ctx), md)
   if (steps.length > 30 || steps.some(st => st.input.length > 600 || (st.output?.length ?? 0) > 800)) {
     mkdirSync(OUT, { recursive: true })
     const p = join(OUT, `${Date.now()}-steps.txt`)
     writeFileSync(p, full)
-    await bot.api.sendDocument(chatId(ctx), new InputFile(p, 'steps.txt'), { caption: 'Full inputs and outputs' }).catch(() => {})
+    await bot.api.sendDocument(chatId(ctx), new InputFile(p, 'steps.txt'), { caption: 'Full inputs and outputs', ...threadOpt(dest(ctx)) }).catch(() => {})
   }
 })
 
 bot.command('diff', async ctx => {
   if (!gate(ctx)) return
-  const cwd = sess(ctx).cwd || loadAccount(uid(ctx)).cwd
+  const cwd = sess(ctx).cwd || loadAccount(keyFor(ctx)).cwd
   const stat = await run('git', ['diff', 'HEAD', '--stat'], cwd)
   if (stat.code !== 0) { await ctx.reply(`Not a git repository: ${cwd}`); return }
   const diff = (await run('git', ['diff', 'HEAD'], cwd)).out
   const untracked = (await run('git', ['ls-files', '--others', '--exclude-standard'], cwd)).out.trim()
   if (!diff.trim() && !untracked) { await ctx.reply(`No uncommitted changes in ${cwd}.`); return }
   const md = `**📝 Changes in \`${cwd}\`**\n\n${fence(stat.out.trim() || '(only untracked files)')}${untracked ? `\n\n**Untracked:**\n${fence(clip(untracked, 1500))}` : ''}${diff.length <= 3000 && diff.trim() ? `\n\n${fence(diff.trim(), 'diff')}` : ''}`
-  await sendRich(bot, chatId(ctx), md)
+  await sendRich(bot, dest(ctx), md)
   if (diff.length > 3000) {
     mkdirSync(OUT, { recursive: true })
     const p = join(OUT, `${Date.now()}-changes.diff`)
     writeFileSync(p, diff)
-    await bot.api.sendDocument(chatId(ctx), new InputFile(p, 'changes.diff')).catch(() => {})
+    await bot.api.sendDocument(chatId(ctx), new InputFile(p, 'changes.diff'), threadOpt(dest(ctx))).catch(() => {})
   }
 })
 
@@ -385,7 +469,7 @@ bot.command('status', async ctx => {
   const mode = `${s.config.find(c => c.id === 'mode')?.currentValue ?? st.mode ?? 'default'} · tools: ${PERMISSIONS.find(p => p.value === (st.permission ?? 'request-review'))?.label}`
   let rss = ''
   if (s.acp?.pid) { const r = await run('ps', ['-o', 'rss=', '-p', String(s.acp.pid)], '/'); rss = r.code === 0 ? ` · ${Math.round(Number(r.out.trim()) / 1024)} MB` : '' }
-  await sendRich(bot, chatId(ctx), [
+  await sendRich(bot, dest(ctx), [
     '## 📊 Status', '',
     '| | |', '|:--|:--|',
     `| agy | ${s.running ? (s.busy ? '⏳ working' : '🟢 idle') : '⚪ stopped (starts on your next message)'}${rss} |`,
@@ -418,16 +502,16 @@ function quotaMd(text: string): string | null {
 }
 async function tuiCommand(ctx: Context, cmd: string, title: string): Promise<void> {
   if (!gate(ctx)) return
-  void bot.api.sendChatAction(chatId(ctx), 'typing').catch(() => {})
+  void bot.api.sendChatAction(chatId(ctx), 'typing', threadOpt(dest(ctx))).catch(() => {})
   try {
     const r = await runTuiCommand(cmd)
     const body = r.text.trim() || '(no output)'
     if (cmd === '/usage') {
       const s = sess(ctx)
       const md = quotaMd(body)
-      if (md) { await sendRich(bot, chatId(ctx), md.replace('${TOKENS}', `${s.tokens.input.toLocaleString()} input · ${s.tokens.output.toLocaleString()} output tokens in ${s.tokens.turns} turns`)); return }
+      if (md) { await sendRich(bot, dest(ctx), md.replace('${TOKENS}', `${s.tokens.input.toLocaleString()} input · ${s.tokens.output.toLocaleString()} output tokens in ${s.tokens.turns} turns`)); return }
     }
-    await sendLong(chatId(ctx), `**${title}**\n\n${fence(clip(body, 3200, true))}`, body, `${cmd.slice(1)}.txt`)
+    await sendLong(dest(ctx), `**${title}**\n\n${fence(clip(body, 3200, true))}`, body, `${cmd.slice(1)}.txt`)
   } catch (e) { await ctx.reply(`⚠️ ${cmd}: ${e instanceof Error ? e.message : e}`) }
 }
 bot.command(['usage', 'quota'], ctx => tuiCommand(ctx, '/usage', '📊 agy usage'))
@@ -454,7 +538,7 @@ bot.command('screen', async ctx => {
   const s = sess(ctx)
   const r = await screenshot(s)
   if (!r.png) { await ctx.reply(`Couldn't draw the screenshot (${r.err}).`); return }
-  await bot.api.sendPhoto(chatId(ctx), new InputFile(r.png, 'screen.png'), { caption: screenCaption(s), reply_markup: screenKb() })
+  await bot.api.sendPhoto(chatId(ctx), new InputFile(r.png, 'screen.png'), { caption: screenCaption(s), reply_markup: screenKb(), ...threadOpt(dest(ctx)) })
 })
 
 bot.command('sessions', async ctx => {
@@ -464,18 +548,19 @@ bot.command('sessions', async ctx => {
   const lines = [`## 🖥 agy sessions · ${mgr.running().length} of ${mgr.maxSessions()} running`, '']
   const kb = new InlineKeyboard()
   for (const s of mgr.running()) {
-    lines.push(`- **${userName(s.account)}${s.account === me ? ' (you)' : ''}** · ${icon(s)}${s.lastUsed ? ` · last message ${ago(s.lastUsed)}` : ''}  \n  📁 \`${s.cwd}\` · 💬 ${s.title || '(new chat)'} · ${modelName(s)}`)
-    if (s.account === me || isAdmin(me)) kb.text(`⏹ Stop ${s.account === me ? 'mine' : userName(s.account)}`, `ss:${s.account}`).row()
+    const topic = s.thread ? ` · 🗂 ${s.state.topicName ?? `topic ${s.thread}`}` : ''
+    lines.push(`- **${userName(s.account)}${s.account === me ? ' (you)' : ''}**${topic} · ${icon(s)}${s.lastUsed ? ` · last message ${ago(s.lastUsed)}` : ''}  \n  📁 \`${s.cwd}\` · 💬 ${s.title || '(new chat)'} · ${modelName(s)}`)
+    if (s.account === me || isAdmin(me)) kb.text(clip(`⏹ Stop ${s.account === me ? 'mine' : userName(s.account)}${s.thread ? `: ${s.state.topicName ?? s.thread}` : ''}`, 60), `ss:${s.key}`).row()
   }
   if (!mgr.running().length) lines.push('_None running. A session starts on an account\'s next message._')
-  lines.push('', `_A stopped session keeps its chat and starts again on that account's next message. When a new one is needed at the limit, the one idle longest is stopped._`)
-  await sendRich(bot, chatId(ctx), lines.join('\n'), { reply_markup: kb })
+  lines.push('', `_A stopped session keeps its chat and starts again on the next message in that chat or topic. When a new one is needed at the limit, the one idle longest is stopped._`)
+  await sendRich(bot, dest(ctx), lines.join('\n'), { reply_markup: kb })
 })
 
 bot.command('live', async ctx => {
   if (!gate(ctx)) return
-  const on = loadAccount(uid(ctx)).live === false
-  saveAccount(uid(ctx), { live: on })
+  const on = loadAccount(keyFor(ctx)).live === false
+  saveAccount(keyFor(ctx), { live: on })
   await ctx.reply(on ? '🟢 Live progress is on.' : '⚪ Live progress is off. You only get the final reply.')
 })
 
@@ -483,9 +568,9 @@ bot.command('live', async ctx => {
 async function agyCli(ctx: Context, sub: string[], title: string): Promise<void> {
   if (!gate(ctx)) return
   const extra = arg(ctx) ? arg(ctx).split(/\s+/) : []
-  const r = await run(AGY_BIN, [...sub, ...extra], sess(ctx).cwd || loadAccount(uid(ctx)).cwd, 60_000)
+  const r = await run(AGY_BIN, [...sub, ...extra], sess(ctx).cwd || loadAccount(keyFor(ctx)).cwd, 60_000)
   const body = r.out.trim() || '(no output)'
-  await sendLong(chatId(ctx), `**${title}**${r.code ? ` · exit ${r.code}` : ''}\n\n${fence(clip(body, 3200, true))}`, body, `${sub[0]}.txt`)
+  await sendLong(dest(ctx), `**${title}**${r.code ? ` · exit ${r.code}` : ''}\n\n${fence(clip(body, 3200, true))}`, body, `${sub[0]}.txt`)
 }
 bot.command('mcp', ctx => agyCli(ctx, ['mcp', ...(arg(ctx) ? [] : ['list'])], '🔌 agy mcp'))
 bot.command('plugins', ctx => agyCli(ctx, ['plugin', ...(arg(ctx) ? [] : ['list'])], '🧩 agy plugins'))
@@ -499,7 +584,7 @@ bot.command('config', async ctx => {
   try { cur = JSON.parse(readFileSync(AGY_SETTINGS, 'utf8')) } catch {}
   const a = arg(ctx)
   if (!a) {
-    await sendRich(bot, chatId(ctx), `**⚙️ agy settings** (\`${AGY_SETTINGS}\`)\n\n${fence(JSON.stringify(cur, null, 2), 'json')}\n\nChange one: \`/config <key> <json value>\`, for example \`/config theme "dark"\`. Remove one: \`/config <key> -\`. Takes effect after /restart.`)
+    await sendRich(bot, dest(ctx), `**⚙️ agy settings** (\`${AGY_SETTINGS}\`)\n\n${fence(JSON.stringify(cur, null, 2), 'json')}\n\nChange one: \`/config <key> <json value>\`, for example \`/config theme "dark"\`. Remove one: \`/config <key> -\`. Takes effect after /restart.`)
     return
   }
   if (!isAdmin(uid(ctx))) { await ctx.reply('🔒 Only an admin can change agy settings (they are shared by all accounts).'); return }
@@ -534,11 +619,12 @@ bot.command('help', async ctx => {
   if (!gate(ctx)) return
   const s = sess(ctx)
   const agyCmds = s.commands.length ? s.commands.map(c => `/${c.name}`).join(' ') : '(send a message first to load them)'
-  await sendRich(bot, chatId(ctx), [
+  await sendRich(bot, dest(ctx), [
     '## Antigravity on Telegram',
     'Messages go to **your own agy session** on the server (each account has its own, like separate terminals). Photos are sent as images; files are saved and their path passed on.',
     '',
     '**Chat:** /new · /resume (`/resume all` for every folder) · /stop (or the Stop button) · /project · /newproject',
+    ...(topicsOn ? ['**Topics:** each topic is its own chat, named `project - chat title`. /new, /resume, /project and /newproject open a new topic; /topics lists and deletes them. Rename a topic yourself and the bot leaves the name alone.'] : []),
     '**agy settings:** /model · /think (thinking level) · /mode (agent mode + tool permission) · /turbo · /permission ask|turbo|sandbox|strict · /config · /restart',
     '**agy tools:** /mcp · /plugins · /agents · /models · /changelog (add arguments to pass them on, e.g. `/mcp disable github`)',
     '**See what happened:** /screen · /steps · /diff · /status · /sessions · /live',
@@ -554,7 +640,7 @@ bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
   const me = uid(ctx)
   if (!isMember(me)) { await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {}); return }
-  const s = mgr.get(me)
+  const s = mgr.get(keyFor(ctx))
   const done = (text?: string) => ctx.answerCallbackQuery(text ? { text } : undefined).catch(() => {})
   const clearKb = () => ctx.editMessageReplyMarkup({ reply_markup: undefined }).catch(() => {})
   let m: RegExpExecArray | null
@@ -604,16 +690,23 @@ bot.on('callback_query:data', async ctx => {
     const x = resumeLists.get(me)?.[Number(m[1])]
     if (!x) { await done('List expired. Send /resume again.'); return }
     if (x.sessionId === s.sessionId) { await done('Already in this chat.'); return }
-    const owner = mgr.ownerOf(x.sessionId, me)
-    if (owner) { await done('🔒 Open in another account'); await ctx.reply(`🔒 That chat is open in ${userName(owner)}'s session. A chat can only run in one place at a time.`); return }
+    const owner = mgr.ownerOf(x.sessionId, s.key)
+    if (owner && owner.split(':')[0] !== me) { await done('🔒 Open in another account'); await ctx.reply(`🔒 That chat is open in ${userName(owner.split(':')[0]!)}'s session. A chat can only run in one place at a time.`); return }
+    const bound = boundKey(me, x.sessionId)
+    if (bound) { await done(); await ctx.reply(`📌 That chat is already in ${whereIs(bound)}`); return }
+    if (topicsOn) {
+      await done(); await clearKb()
+      try { await openTopic(ctx, x.cwd, x) } catch (e) { await ctx.reply(`⚠️ ${e instanceof Error ? e.message : e}`) }
+      return
+    }
     if (s.busy) { await done('agy is working. /stop first.'); return }
     await done(); await clearKb()
     try {
       await s.ensure()
-      const last = await s.open(x.sessionId, x.cwd)
+      const last = await s.open(x.sessionId, x.cwd, x.title)
       const prev = last && (last.user || last.agent)
         ? `\n\n**Last exchange**\n\n> **You:** ${clip(last.user.trim().replace(/\n+/g, ' '), 400)}\n\n**agy:** ${clip(last.agent.trim(), 1500)}` : ''
-      await sendRich(bot, chatId(ctx), `↩️ **Resumed:** ${x.title || x.sessionId}\n📁 \`${x.cwd}\`${prev}`)
+      await sendRich(bot, dest(ctx), `↩️ **Resumed:** ${x.title || x.sessionId}\n📁 \`${x.cwd}\`${prev}`)
     } catch (e) { await ctx.reply(`⚠️ ${e instanceof Error ? e.message : e}`) }
     return
   }
@@ -624,15 +717,31 @@ bot.on('callback_query:data', async ctx => {
     await switchProject(ctx, p)
     return
   }
-  if ((m = /^ss:(\d+)$/.exec(data))) {
-    const target = m[1]!
+  if ((m = /^td:(\d+)$/.exec(data))) {
+    const th = Number(m[1])
+    const key = keyOf(me, th)
+    await done(); await clearKb()
+    const t = mgr.sessions.get(key)
+    if (t?.busy) await t.cancel()
+    mgr.drop(key)
+    const name = loadAccount(key).topicName ?? `topic ${th}`
+    deleteAccount(key)
+    const err = await bot.api.deleteForumTopic(Number(me), th).then(() => '', e => String(e))
+    const text = err && !/not found|TOPIC_ID_INVALID/i.test(err) ? `⚠️ Removed “${name}” here, but Telegram didn't delete the topic: ${err}` : `🗑 Deleted the topic “${name}”. Its agy chat is kept; /resume can open it again.`
+    // If the button was inside the deleted topic, answer in the main chat.
+    await bot.api.sendMessage(me, text, threadOf(ctx) === th ? {} : threadOpt(dest(ctx))).catch(() => {})
+    return
+  }
+  if ((m = /^ss:(\d+(?::\d+)?)$/.exec(data))) {
+    const t = mgr.sessions.get(m[1]!)
+    const target = m[1]!.split(':')[0]!
     if (target !== me && !isAdmin(me)) { await done('You can only stop your own session.'); return }
     await done(); await clearKb()
-    const t = mgr.get(target)
+    if (!t) { await ctx.reply('That session is not running any more.'); return }
     if (t.busy) await t.cancel()
     t.stop()
     await ctx.reply(`⏹ Stopped ${target === me ? 'your' : `${userName(target)}'s`} agy session. The chat is kept; it starts again on the next message.`)
-    if (target !== me) await bot.api.sendMessage(target, `⏹ ${displayName(ctx.from)} stopped your agy session (your chat is kept; it starts again on your next message).`).catch(() => {})
+    if (target !== me) await sendRich(bot, t.dest, `⏹ ${displayName(ctx.from)} stopped your agy session (your chat is kept; it starts again on your next message).`).catch(() => {})
     return
   }
   if ((m = /^us:(rm|ad|un):(\d+)$/.exec(data))) {
@@ -642,7 +751,7 @@ bot.on('callback_query:data', async ctx => {
     if (op === 'rm') {
       if (sh.users) delete sh.users[id!]
       sh.admins = (sh.admins ?? []).filter(a => a !== id)
-      mgr.get(id!).stop()
+      for (const x of mgr.ofAccount(id!)) mgr.drop(x.key)
     } else if (op === 'ad') sh.admins = [...new Set([...(sh.admins ?? []), id!])]
     else sh.admins = (sh.admins ?? []).filter(a => a !== id)
     saveShared(sh)
@@ -657,12 +766,12 @@ bot.on('callback_query:data', async ctx => {
 // --- messages ----------------------------------------------------------------------------
 async function runShell(ctx: Context, cmd: string): Promise<void> {
   if (loadShared().shell === false) { await ctx.reply('! shell commands are turned off (admin: /shell on).'); return }
-  const cwd = sess(ctx).cwd || loadAccount(uid(ctx)).cwd
+  const cwd = sess(ctx).cwd || loadAccount(keyFor(ctx)).cwd
   appendFileSync(SHELL_LOG, `${new Date().toISOString()} ${uid(ctx)} ${displayName(ctx.from)} [${cwd}] ${cmd}\n`)
-  void bot.api.sendChatAction(chatId(ctx), 'typing').catch(() => {})
+  void bot.api.sendChatAction(chatId(ctx), 'typing', threadOpt(dest(ctx))).catch(() => {})
   const r = await run('bash', ['-lc', cmd], cwd, 120_000)
   const body = r.out.trim() || '(no output)'
-  await sendLong(chatId(ctx), `${r.code === 0 ? '✅' : `❌ exit ${r.code}`} \`${clip(cmd, 100)}\`\n\n${fence(clip(body, 3200, true))}`, body, 'output.txt')
+  await sendLong(dest(ctx), `${r.code === 0 ? '✅' : `❌ exit ${r.code}`} \`${clip(cmd, 100)}\`\n\n${fence(clip(body, 3200, true))}`, body, 'output.txt')
 }
 
 async function download(fileId: string, name?: string): Promise<{ path: string; buf: Buffer }> {
@@ -681,7 +790,18 @@ async function download(fileId: string, name?: string): Promise<{ path: string; 
 bot.on('message', async ctx => {
   if (!gate(ctx)) return
   const msg = ctx.message
-  const chat = chatId(ctx)
+  // Topic service messages: remember a name the user chose, so we don't rename over it.
+  if (msg.forum_topic_created) {
+    if (!msg.forum_topic_created.is_name_implicit && msg.message_thread_id) saveAccount(keyOf(uid(ctx), msg.message_thread_id), { topicName: msg.forum_topic_created.name, manualName: true })
+    return
+  }
+  if (msg.forum_topic_edited) {
+    const name = msg.forum_topic_edited.name
+    const key = keyOf(uid(ctx), msg.message_thread_id)
+    if (name && msg.message_thread_id && msg.from?.id !== ctx.me.id && loadAccount(key).topicName !== name) saveAccount(key, { topicName: name, manualName: true })
+    return
+  }
+  if (msg.forum_topic_closed || msg.forum_topic_reopened) return
   let text = msg.text ?? msg.caption ?? ''
   if (msg.text?.startsWith('!') && msg.text.length > 1) { await runShell(ctx, msg.text.slice(1).trim()); return }
   // Unknown /commands (agy's own: /goal, /compact, /plan …) go to agy as typed.
@@ -707,7 +827,7 @@ bot.on('message', async ctx => {
   if (text.trim()) blocks.push({ type: 'text', text })
   if (!blocks.length) return
   // Don't await: grammY handles updates one at a time, and the turn may wait for a button press.
-  void mgr.get(uid(ctx)).prompt(chat, blocks).catch(e => log('prompt failed', e))
+  void sess(ctx).prompt(blocks).catch(e => log('prompt failed', e))
 })
 
 // --- command menu ------------------------------------------------------------------------
@@ -715,7 +835,7 @@ const BOT_COMMANDS = [
   ['new', 'Start a new chat'], ['resume', 'Open a previous chat'], ['stop', 'Stop what agy is doing'],
   ['model', 'Choose the model'], ['think', 'Thinking level (low/medium/high)'], ['mode', 'Agent mode and tool permission (turbo)'], ['turbo', 'Run commands without asking'],
   ['project', 'Switch folder'], ['newproject', 'Create a project (optionally from a git repo)'], ['steps', 'Steps of the last turn, with outputs'], ['diff', 'Uncommitted changes'],
-  ['status', 'Folder, model, mode, chat'], ['sessions', 'Who is running what'], ['mcp', 'agy MCP servers'],
+  ['status', 'Folder, model, mode, chat'], ['sessions', 'Who is running what'], ['topics', 'Your topics (one chat each)'], ['mcp', 'agy MCP servers'],
   ['plugins', 'agy plugins'], ['agents', 'agy agents'], ['config', 'agy settings'], ['restart', 'Restart your agy (admin: all, bot, claude)'],
   ['live', 'Toggle live progress'], ['usage', 'agy quota (5-hour and weekly limits)'], ['screen', 'Terminal-style screenshot'], ['credits', 'agy credits'], ['skills', 'agy skills'], ['users', 'Manage accounts (admin)'],
   ['invite', 'Invite another account (admin)'], ['cleanup', 'Delete saved files (admin)'], ['help', 'All commands'],
@@ -752,7 +872,8 @@ for (let attempt = 1; ; attempt++) {
       onStart: info => {
         attempt = 0
         botUsername = info.username
-        log(`polling as @${info.username}`)
+        topicsOn = Boolean(info.has_topics_enabled)
+        log(`polling as @${info.username}${topicsOn ? ' (topics on: one chat per topic)' : ''}`)
         void bot.api.setMyCommands(BOT_COMMANDS, { scope: { type: 'all_private_chats' } }).catch(e => log('setMyCommands', e))
       },
     })

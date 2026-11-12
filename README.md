@@ -11,6 +11,13 @@ output, plans and permission requests.
 - **One agy session per Telegram account.** Accounts work in parallel, like separate terminals
   on the same machine. At most `MAX_SESSIONS` (default 3) run at once; the session idle longest is
   stopped when another one is needed, and its chat reopens on that account's next message.
+- **Topics: one chat per topic** (optional). Turn on topic mode for the bot in @BotFather and
+  each topic in your chat with the bot becomes its own agy chat, so several projects and
+  conversations stay side by side. Topics are named `project - chat title`; the bot renames a topic
+  when agy titles the chat, unless you renamed it yourself. `/new`, `/resume`, `/project` and
+  `/newproject` open a new topic, and `/topics` lists and deletes them. Each topic that is in use
+  runs its own agy process, under the same `MAX_SESSIONS` cap; idle ones are stopped and start
+  again on the next message. Without topic mode the bot works as before.
 - **Live progress.** The reply streams word by word into a Telegram draft, together with the
   plan checklist and each tool step, which you can tap open to see its input and output. The
   draft has Telegram's Stop button.
@@ -72,7 +79,7 @@ which is not tracked by git.
 | File | What it does |
 |---|---|
 | `src/bot.ts` | Telegram commands, buttons, messages, accounts |
-| `src/session.ts` | One agy process and chat per account; streaming, steps, permissions, session cap |
+| `src/session.ts` | One agy process and chat per account or topic; streaming, steps, permissions, session cap |
 | `src/acp.ts` | Small ACP (JSON-RPC over stdio) client for `agy acp` |
 | `src/rich.ts` | Telegram Rich Messages (Markdown), adapted from the claude-telegram plugin |
 | `src/store.ts` | JSON state in `./data` |
