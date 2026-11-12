@@ -10,6 +10,7 @@ import { homedir } from 'os'
 import { sendRich, fence, clip } from './rich.ts'
 import { SessionManager, AgentSession, stepsMd, AGY_BIN, PERMISSIONS, screenAnsi } from './session.ts'
 import { runTuiCommand } from './tui.ts'
+import { scan, older, remove, human, summary } from './cleanup.ts'
 import { parseArgs, createProject, NEWPROJECT_HELP, PROJECTS_BASE } from './newproject.ts'
 import {
   DATA, ROOT, loadShared, saveShared, loadAccount, saveAccount, adminIds, isAdmin, isMember, memberIds,
@@ -491,6 +492,14 @@ bot.command('config', async ctx => {
   await ctx.reply(`✅ Saved. /restart to apply it to your session.`)
 })
 
+bot.command('cleanup', async ctx => {
+  if (!adminGate(ctx)) return
+  const all = scan([INBOX, OUT])
+  const kb = new InlineKeyboard()
+  if (all.length) kb.text('🗑 Delete all', 'cl:all').text('Older than 7 days', 'cl:7').row().text('Cancel', 'cl:no')
+  await ctx.reply(summary([INBOX, OUT]), all.length ? { reply_markup: kb } : undefined)
+})
+
 bot.command('shell', async ctx => {
   if (!adminGate(ctx)) return
   const a = arg(ctx).toLowerCase()
@@ -514,7 +523,7 @@ bot.command('help', async ctx => {
     '**agy account:** /usage (quota) · /credits · /skills · /tui <any agy terminal command>',
     '**Shell:** `!git status` runs directly on the server',
     `**agy's own commands** (sent to agy as typed): ${agyCmds}`,
-    '**Admin:** /invite · /users · /shell on|off',
+    '**Admin:** /invite · /users · /shell on|off · /cleanup (delete saved voice messages, photos and files)',
   ].join('\n'))
 })
 
@@ -528,6 +537,15 @@ bot.on('callback_query:data', async ctx => {
   const clearKb = () => ctx.editMessageReplyMarkup({ reply_markup: undefined }).catch(() => {})
   let m: RegExpExecArray | null
 
+  if ((m = /^cl:(all|7|no)$/.exec(data))) {
+    if (!isAdmin(me)) { await done('Admins only.'); return }
+    await done(); await clearKb()
+    if (m[1] === 'no') { await ctx.reply('OK, nothing deleted.'); return }
+    const all = scan([INBOX, OUT])
+    const r = remove(m[1] === 'all' ? all : older(all, 7))
+    await ctx.reply(`🧹 Deleted ${r.count} file${r.count === 1 ? '' : 's'}, freed ${human(r.bytes)}.`)
+    return
+  }
   if (data === 'sc:refresh') {
     const r = await screenshot(s)
     if (!r.png) { await done(`Couldn't draw: ${r.err}`); return }
@@ -657,7 +675,7 @@ bot.on('message', async ctx => {
       if (d.file_size && d.file_size > 20 * 1024 * 1024) { await ctx.reply('That file is over 20 MB, the limit for bots. Put it on the server another way.'); return }
       const { path } = await download(d.file_id, d.file_name ?? (msg.voice ? 'voice.oga' : undefined))
       text = msg.voice || msg.audio
-        ? `${text}\n\n[The user sent a ${msg.voice ? 'voice message' : 'audio file'}, saved at: ${path}. Listen to it (open the file) and treat what they say as their request; answer in the language they speak.]`.trim()
+        ? `${text}\n\n[The user sent a ${msg.voice ? 'voice message' : 'audio file'}, saved at: ${path}. Listen to it (open the file). Start your reply with what you heard, word for word in the language spoken, as a quote line beginning with "🎤", so they can check you heard correctly. Then treat what they said as their request and answer in the language they speak.]`.trim()
         : `${text}\n\n[The user sent a file, saved on the server at: ${path}]`.trim()
     }
   } catch (e) { await ctx.reply(`⚠️ Couldn't download the attachment: ${e instanceof Error ? e.message : e}`); return }
@@ -678,7 +696,7 @@ const BOT_COMMANDS = [
   ['status', 'Folder, model, mode, chat'], ['sessions', 'Who is running what'], ['mcp', 'agy MCP servers'],
   ['plugins', 'agy plugins'], ['agents', 'agy agents'], ['config', 'agy settings'], ['restart', 'Restart your agy process'],
   ['live', 'Toggle live progress'], ['usage', 'agy quota (5-hour and weekly limits)'], ['screen', 'Terminal-style screenshot'], ['credits', 'agy credits'], ['skills', 'agy skills'], ['users', 'Manage accounts (admin)'],
-  ['invite', 'Invite another account (admin)'], ['help', 'All commands'],
+  ['invite', 'Invite another account (admin)'], ['cleanup', 'Delete saved files (admin)'], ['help', 'All commands'],
 ].map(([command, description]) => ({ command: command!, description: description! }))
 const menuSent = new Map<string, string>()
 mgr.onCommands = s => {
