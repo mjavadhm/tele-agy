@@ -36,6 +36,7 @@ export type ConfigOption = { id: string; name: string; currentValue: string; opt
 export type Command = { name: string; description: string }
 
 type Turn = {
+  prompt: string
   chat_id: string
   draftId: number
   started: number
@@ -111,6 +112,7 @@ export class AgentSession {
   turn: Turn | null = null
   queue: Queued[] = []
   lastSteps: Step[] = []
+  lastTurn: { prompt: string; text: string; steps: Step[]; plan: PlanEntry[]; note: string; secs: number } | null = null
   lastUsed = 0
   tokens = { input: 0, output: 0, turns: 0 }
   private starting: Promise<void> | null = null
@@ -263,6 +265,7 @@ export class AgentSession {
 
   private async runTurn(q: Queued): Promise<void> {
     const t: Turn = {
+      prompt: q.blocks.map(b => b.type === 'text' ? b.text : b.type === 'image' ? '[image]' : '').join(' ').trim(),
       chat_id: q.chat_id, draftId: 1 + Math.floor(Math.random() * 2_000_000_000), started: Date.now(),
       text: '', thought: '', thinking: true, steps: [], stepById: new Map(), plan: [], lastDraft: '', lastDraftAt: 0,
       timer: setInterval(() => void this.pushDraft(), DRAFT_EVERY_MS),
@@ -293,6 +296,7 @@ export class AgentSession {
     this.turn = null
     this.lastUsed = Date.now()
     if (t.steps.length) this.lastSteps = t.steps
+    this.lastTurn = { prompt: t.prompt, text: t.text, steps: t.steps, plan: t.plan, note, secs: Math.round((Date.now() - t.started) / 1000) }
     const parts: string[] = []
     if (t.text.trim()) parts.push(t.text.trim())
     if (t.plan.length && !t.text.trim()) parts.push(planMd(t.plan))
@@ -468,4 +472,54 @@ export class SessionManager {
     for (const s of this.sessions.values()) if (s.account !== except && s.running && s.sessionId === sessionId) return s.account
     return null
   }
+}
+
+// --- /screen: a terminal-style view of the current (or last) turn, as ANSI text ----------------
+const A = { reset: '\x1b[0m', dim: '\x1b[2m', bold: '\x1b[1m', green: '\x1b[32m', red: '\x1b[31m', yellow: '\x1b[33m', cyan: '\x1b[36m', blue: '\x1b[34m', gray: '\x1b[90m', inv: '\x1b[7m' }
+function wrap(s: string, width: number): string[] {
+  const out: string[] = []
+  for (const raw of s.replace(/\r/g, '').split('\n')) {
+    let line = raw
+    while ([...line].length > width) { const ch = [...line]; out.push(ch.slice(0, width).join('')); line = ch.slice(width).join('') }
+    out.push(line)
+  }
+  return out
+}
+export function screenAnsi(s: AgentSession, width = 100): string {
+  const live = s.turn
+  const t = live
+    ? { prompt: live.prompt, text: live.text, steps: live.steps, plan: live.plan, note: '', secs: Math.round((Date.now() - live.started) / 1000) }
+    : s.lastTurn
+  const out: string[] = []
+  const rule = A.gray + '─'.repeat(width) + A.reset
+  const model = s.config.find(c => c.id === 'model')
+  const modelName = model?.options.find(o => o.value === model.currentValue)?.name ?? model?.currentValue ?? ''
+  out.push(`${A.bold}${A.cyan}Antigravity${A.reset} ${A.gray}· ${s.title || '(new chat)'} · ${s.cwd}${A.reset}`, rule)
+  if (!t) out.push(`${A.gray}Nothing has run in this session yet.${A.reset}`)
+  else {
+    for (const l of wrap(`> ${t.prompt || '(attachment)'}`, width).slice(0, 8)) out.push(`${A.bold}${l}${A.reset}`)
+    out.push('')
+    for (const e of t.plan) {
+      const box = e.status === 'completed' ? `${A.green}☑` : e.status === 'in_progress' ? `${A.yellow}▸` : `${A.gray}☐`
+      out.push(`${box} ${e.content}${A.reset}`)
+    }
+    if (t.plan.length) out.push('')
+    for (const st of t.steps.slice(-12)) {
+      const mark = st.status === 'completed' ? `${A.green}●` : st.status === 'failed' ? `${A.red}●` : `${A.yellow}●`
+      out.push(`${mark}${A.reset} ${A.bold}${clip(st.label.replace(/\s+/g, ' '), width - 4)}${A.reset}`)
+      const o = (st.output ?? (st.status === 'completed' ? '' : 'running…')).replace(/\r/g, '').trim()
+      const lines = o.split('\n').filter(x => x.trim()).slice(-6)
+      lines.forEach((l, i) => out.push(`${A.gray}  ${i === 0 ? '⎿' : ' '} ${clip(l, width - 6)}${A.reset}`))
+    }
+    if (t.text.trim()) {
+      out.push('')
+      for (const l of wrap(t.text.trim(), width).slice(-40)) out.push(l)
+    }
+    out.push('')
+    out.push(live ? `${A.yellow}✻ Working… ${t.secs}s${A.reset}` : `${A.gray}✻ Done in ${t.secs}s${t.note ? ` · ${t.note}` : ''}${A.reset}`)
+  }
+  const mode = s.config.find(c => c.id === 'mode')?.currentValue ?? 'default'
+  const perm = PERMISSIONS.find(p => p.value === (s.state.permission ?? 'request-review'))?.short ?? ''
+  out.push(rule, `${A.gray}${modelName} · mode ${mode} · tools ${perm}${A.reset}`)
+  return out.join('\n')
 }

@@ -8,7 +8,8 @@ import { join, basename } from 'path'
 import { randomBytes } from 'crypto'
 import { homedir } from 'os'
 import { sendRich, fence, clip } from './rich.ts'
-import { SessionManager, AgentSession, stepsMd, AGY_BIN, PERMISSIONS } from './session.ts'
+import { SessionManager, AgentSession, stepsMd, AGY_BIN, PERMISSIONS, screenAnsi } from './session.ts'
+import { runTuiCommand } from './tui.ts'
 import {
   DATA, ROOT, loadShared, saveShared, loadAccount, saveAccount, adminIds, isAdmin, isMember, memberIds,
 } from './store.ts'
@@ -359,10 +360,63 @@ bot.command('status', async ctx => {
     `| Tokens this run | ${s.tokens.input.toLocaleString()} in · ${s.tokens.output.toLocaleString()} out · ${s.tokens.turns} turns |`,
   ].join('\n'))
 })
-bot.command('usage', async ctx => {
+// --- agy terminal-only commands (/usage, /credits, /skills …), via a hidden agy terminal ------
+function quotaMd(text: string): string | null {
+  const rows: string[] = []
+  let group = '', limit = ''
+  for (const raw of text.split('\n')) {
+    const l = raw.trim()
+    if (/^[A-Z][A-Z &]+$/.test(l)) { group = l.replace(/\bMODELS\b/, '').trim(); continue }
+    if (/Limit Remaining$/.test(l)) { limit = l.replace(/ Limit Remaining$/, ''); continue }
+    const pct = /\]\s*([\d.]+)%/.exec(l)
+    if (pct && group && limit) { rows.push(`| ${group} | ${limit} | **${pct[1]}%** left |`); continue }
+    if (rows.length && /^(Refreshes in|Quota available)/.test(l)) rows[rows.length - 1] = rows[rows.length - 1]!.replace(/ \|$/, ` | ${l.replace('Refreshes in ', '')} |`)
+  }
+  if (!rows.length) return null
+  const account = /Account:\s*(\S+)/.exec(text)?.[1]
+  return [`## 📊 agy quota${account ? ` · ${account}` : ''}`, '', '| Models | Limit | Remaining | Refreshes |', '|:--|:--|:--|:--|',
+    ...rows.map(r => r.split('|').length < 6 ? r.replace(/ \|$/, ' | |') : r), '',
+    `_Each group shares a weekly and a 5-hour limit. This run: ${'${TOKENS}'}._`].join('\n')
+}
+async function tuiCommand(ctx: Context, cmd: string, title: string): Promise<void> {
+  if (!gate(ctx)) return
+  void bot.api.sendChatAction(chatId(ctx), 'typing').catch(() => {})
+  try {
+    const r = await runTuiCommand(cmd)
+    const body = r.text.trim() || '(no output)'
+    if (cmd === '/usage') {
+      const s = sess(ctx)
+      const md = quotaMd(body)
+      if (md) { await sendRich(bot, chatId(ctx), md.replace('${TOKENS}', `${s.tokens.input.toLocaleString()} input · ${s.tokens.output.toLocaleString()} output tokens in ${s.tokens.turns} turns`)); return }
+    }
+    await sendLong(chatId(ctx), `**${title}**\n\n${fence(clip(body, 3200, true))}`, body, `${cmd.slice(1)}.txt`)
+  } catch (e) { await ctx.reply(`⚠️ ${cmd}: ${e instanceof Error ? e.message : e}`) }
+}
+bot.command(['usage', 'quota'], ctx => tuiCommand(ctx, '/usage', '📊 agy usage'))
+bot.command('credits', ctx => tuiCommand(ctx, '/credits', '💳 agy credits'))
+bot.command('skills', ctx => tuiCommand(ctx, '/skills', '🧠 agy skills'))
+bot.command('tui', async ctx => {
+  const a = arg(ctx)
+  if (!/^\/?[\w-]+( .*)?$/.test(a)) { await ctx.reply('Usage: /tui <agy terminal command>, e.g. /tui /hooks. Runs it in a fresh agy terminal (not your chat) and sends what it shows.'); return }
+  await tuiCommand(ctx, a.startsWith('/') ? a : `/${a}`, `agy ${a}`)
+})
+
+// --- /screen: terminal-style screenshot of your session --------------------------------------
+async function screenshot(s: AgentSession): Promise<{ png?: Buffer; err?: string; ansi: string }> {
+  const ansi = screenAnsi(s)
+  try {
+    const { renderScreen } = await import('./screen.ts')
+    return { png: renderScreen(ansi).png, ansi }
+  } catch (e) { return { err: e instanceof Error ? e.message : String(e), ansi } }
+}
+const screenKb = () => new InlineKeyboard().text('🔄 Refresh', 'sc:refresh')
+const screenCaption = (s: AgentSession) => `${s.busy ? '⏳ working' : s.running ? '🟢 idle' : '⚪ stopped'} · ${s.cwd || s.state.cwd} · ${new Date().toLocaleTimeString('en-GB', { hour12: false })}`
+bot.command('screen', async ctx => {
   if (!gate(ctx)) return
   const s = sess(ctx)
-  await ctx.reply(`Tokens since your agy process started: ${s.tokens.input.toLocaleString()} input, ${s.tokens.output.toLocaleString()} output, ${s.tokens.turns} turns.\nagy has no plan-usage API; check quotas in the Antigravity app.`)
+  const r = await screenshot(s)
+  if (!r.png) { await ctx.reply(`Couldn't draw the screenshot (${r.err}).`); return }
+  await bot.api.sendPhoto(chatId(ctx), new InputFile(r.png, 'screen.png'), { caption: screenCaption(s), reply_markup: screenKb() })
 })
 
 bot.command('sessions', async ctx => {
@@ -441,7 +495,8 @@ bot.command('help', async ctx => {
     '**Chat:** /new · /resume (`/resume all` for every folder) · /stop (or the Stop button) · /project',
     '**agy settings:** /model · /think (thinking level) · /mode (agent mode + tool permission) · /turbo · /permission ask|turbo|sandbox|strict · /config · /restart',
     '**agy tools:** /mcp · /plugins · /agents · /models · /changelog (add arguments to pass them on, e.g. `/mcp disable github`)',
-    '**See what happened:** /steps · /diff · /status · /usage · /sessions · /live',
+    '**See what happened:** /screen · /steps · /diff · /status · /sessions · /live',
+    '**agy account:** /usage (quota) · /credits · /skills · /tui <any agy terminal command>',
     '**Shell:** `!git status` runs directly on the server',
     `**agy's own commands** (sent to agy as typed): ${agyCmds}`,
     '**Admin:** /invite · /users · /shell on|off',
@@ -458,6 +513,13 @@ bot.on('callback_query:data', async ctx => {
   const clearKb = () => ctx.editMessageReplyMarkup({ reply_markup: undefined }).catch(() => {})
   let m: RegExpExecArray | null
 
+  if (data === 'sc:refresh') {
+    const r = await screenshot(s)
+    if (!r.png) { await done(`Couldn't draw: ${r.err}`); return }
+    await ctx.editMessageMedia({ type: 'photo', media: new InputFile(r.png, 'screen.png'), caption: screenCaption(s) }, { reply_markup: screenKb() })
+      .then(() => done('Updated'), () => done('No change'))
+    return
+  }
   if ((m = /^pm:([0-9a-f]{6}):(\d+)$/.exec(data))) {
     const r = s.answerPermission(m[1]!, Number(m[2]))
     if (!r) { await done('Already answered or expired.'); await clearKb(); return }
@@ -598,7 +660,7 @@ const BOT_COMMANDS = [
   ['project', 'Switch folder'], ['steps', 'Steps of the last turn, with outputs'], ['diff', 'Uncommitted changes'],
   ['status', 'Folder, model, mode, chat'], ['sessions', 'Who is running what'], ['mcp', 'agy MCP servers'],
   ['plugins', 'agy plugins'], ['agents', 'agy agents'], ['config', 'agy settings'], ['restart', 'Restart your agy process'],
-  ['live', 'Toggle live progress'], ['usage', 'Token usage'], ['users', 'Manage accounts (admin)'],
+  ['live', 'Toggle live progress'], ['usage', 'agy quota (5-hour and weekly limits)'], ['screen', 'Terminal-style screenshot'], ['credits', 'agy credits'], ['skills', 'agy skills'], ['users', 'Manage accounts (admin)'],
   ['invite', 'Invite another account (admin)'], ['help', 'All commands'],
 ].map(([command, description]) => ({ command: command!, description: description! }))
 const menuSent = new Map<string, string>()
