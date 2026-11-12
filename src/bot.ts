@@ -10,6 +10,7 @@ import { homedir } from 'os'
 import { sendRich, fence, clip } from './rich.ts'
 import { SessionManager, AgentSession, stepsMd, AGY_BIN, PERMISSIONS, screenAnsi } from './session.ts'
 import { runTuiCommand } from './tui.ts'
+import { parseArgs, createProject, NEWPROJECT_HELP, PROJECTS_BASE } from './newproject.ts'
 import {
   DATA, ROOT, loadShared, saveShared, loadAccount, saveAccount, adminIds, isAdmin, isMember, memberIds,
 } from './store.ts'
@@ -26,7 +27,7 @@ for (const f of [join(ROOT, '.env')]) {
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN
 if (!TOKEN) { console.error('TELEGRAM_BOT_TOKEN missing (see .env.example)'); process.exit(1) }
 if (!adminIds().length) { console.error('ADMIN_IDS missing (see .env.example)'); process.exit(1) }
-const PROJECT_ROOTS = (process.env.PROJECT_ROOTS ?? homedir()).split(':')
+const PROJECT_ROOTS = (process.env.PROJECT_ROOTS ?? `${homedir()}:${process.env.PROJECTS_BASE ?? '/root/project'}`).split(':')
 const INBOX = join(DATA, 'inbox')
 const OUT = join(DATA, 'out')
 const SHELL_LOG = join(DATA, 'shell.log')
@@ -284,6 +285,20 @@ bot.command('project', async ctx => {
   await ctx.reply(`Current folder: ${cur}\nPick one, or send /project <path>:`, { reply_markup: kb })
 })
 
+bot.command('newproject', async ctx => {
+  if (!gate(ctx)) return
+  const a = parseArgs(arg(ctx))
+  if (a === 'usage') { await sendRich(bot, chatId(ctx), NEWPROJECT_HELP); return }
+  if (typeof a === 'string') { await ctx.reply(a); return }
+  if (sess(ctx).busy) { await ctx.reply('⏳ agy is working. /stop first.'); return }
+  void bot.api.sendChatAction(chatId(ctx), 'typing').catch(() => {})
+  try {
+    const p = await createProject(a.target, a.remote)
+    await sendRich(bot, chatId(ctx), `📁 **${p.dir}**\n${p.report}`)
+    await switchProject(ctx, p.dir)
+  } catch (e) { await ctx.reply(`⚠️ ${e instanceof Error ? e.message : e}`) }
+})
+
 bot.command('stop', async ctx => {
   if (!gate(ctx)) return
   const ok = await sess(ctx).cancel()
@@ -492,7 +507,7 @@ bot.command('help', async ctx => {
     '## Antigravity on Telegram',
     'Messages go to **your own agy session** on the server (each account has its own, like separate terminals). Photos are sent as images; files are saved and their path passed on.',
     '',
-    '**Chat:** /new · /resume (`/resume all` for every folder) · /stop (or the Stop button) · /project',
+    '**Chat:** /new · /resume (`/resume all` for every folder) · /stop (or the Stop button) · /project · /newproject',
     '**agy settings:** /model · /think (thinking level) · /mode (agent mode + tool permission) · /turbo · /permission ask|turbo|sandbox|strict · /config · /restart',
     '**agy tools:** /mcp · /plugins · /agents · /models · /changelog (add arguments to pass them on, e.g. `/mcp disable github`)',
     '**See what happened:** /screen · /steps · /diff · /status · /sessions · /live',
@@ -640,8 +655,10 @@ bot.on('message', async ctx => {
     } else if (msg.document || msg.video || msg.audio || msg.voice) {
       const d: any = msg.document ?? msg.video ?? msg.audio ?? msg.voice
       if (d.file_size && d.file_size > 20 * 1024 * 1024) { await ctx.reply('That file is over 20 MB, the limit for bots. Put it on the server another way.'); return }
-      const { path } = await download(d.file_id, d.file_name)
-      text = `${text}\n\n[The user sent a file, saved on the server at: ${path}]`.trim()
+      const { path } = await download(d.file_id, d.file_name ?? (msg.voice ? 'voice.oga' : undefined))
+      text = msg.voice || msg.audio
+        ? `${text}\n\n[The user sent a ${msg.voice ? 'voice message' : 'audio file'}, saved at: ${path}. Listen to it (open the file) and treat what they say as their request; answer in the language they speak.]`.trim()
+        : `${text}\n\n[The user sent a file, saved on the server at: ${path}]`.trim()
     }
   } catch (e) { await ctx.reply(`⚠️ Couldn't download the attachment: ${e instanceof Error ? e.message : e}`); return }
   if (msg.reply_to_message && 'text' in msg.reply_to_message && msg.reply_to_message.text) {
@@ -657,7 +674,7 @@ bot.on('message', async ctx => {
 const BOT_COMMANDS = [
   ['new', 'Start a new chat'], ['resume', 'Open a previous chat'], ['stop', 'Stop what agy is doing'],
   ['model', 'Choose the model'], ['think', 'Thinking level (low/medium/high)'], ['mode', 'Agent mode and tool permission (turbo)'], ['turbo', 'Run commands without asking'],
-  ['project', 'Switch folder'], ['steps', 'Steps of the last turn, with outputs'], ['diff', 'Uncommitted changes'],
+  ['project', 'Switch folder'], ['newproject', 'Create a project (optionally from a git repo)'], ['steps', 'Steps of the last turn, with outputs'], ['diff', 'Uncommitted changes'],
   ['status', 'Folder, model, mode, chat'], ['sessions', 'Who is running what'], ['mcp', 'agy MCP servers'],
   ['plugins', 'agy plugins'], ['agents', 'agy agents'], ['config', 'agy settings'], ['restart', 'Restart your agy process'],
   ['live', 'Toggle live progress'], ['usage', 'agy quota (5-hour and weekly limits)'], ['screen', 'Terminal-style screenshot'], ['credits', 'agy credits'], ['skills', 'agy skills'], ['users', 'Manage accounts (admin)'],

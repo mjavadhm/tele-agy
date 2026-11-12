@@ -21,6 +21,8 @@ output, plans and permission requests.
     strict. Use `/mode` buttons, `/turbo` or `/permission`. It is written to agy's `settings.json`
     just before that account's agy starts, so each account keeps its own choice
   - `/new`, `/resume` (`/resume all` covers every folder) and `/project`
+  - `/newproject <name> [git url]`: a new folder under `/root/project` (or a full path), empty with
+    `git init`, or cloned from a remote (private GitHub repos work through the server's `gh` login)
   - `/restart` and `/config` (agy's `settings.json`)
 - **agy's own commands** (`/goal`, `/compact`, `/plan`, `/browser`, `/teamwork` …) are sent to agy
   as typed. They are also added to your `/` menu.
@@ -31,8 +33,8 @@ output, plans and permission requests.
     `/sessions`, `/usage`, `/live`
   - `!command` runs a shell command in your folder; it is logged, and an admin can turn it off
     with `/shell off`
-- **Attachments:** photos are sent to agy as images. Other files are saved on the server and their
-  path is passed on.
+- **Attachments:** photos are sent to agy as images. Voice messages and other files are saved on
+  the server and their path is passed on; agy listens to voice messages itself.
 - **Accounts:** admins come from `ADMIN_IDS`. An admin's `/invite` makes a 15-minute link, and
   `/users` removes accounts or makes them admins.
 
