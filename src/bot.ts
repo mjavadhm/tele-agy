@@ -8,7 +8,7 @@ import { join, basename } from 'path'
 import { randomBytes } from 'crypto'
 import { homedir } from 'os'
 import { sendRich, fence, clip } from './rich.ts'
-import { SessionManager, AgentSession, stepsMd, AGY_BIN } from './session.ts'
+import { SessionManager, AgentSession, stepsMd, AGY_BIN, PERMISSIONS } from './session.ts'
 import {
   DATA, ROOT, loadShared, saveShared, loadAccount, saveAccount, adminIds, isAdmin, isMember, memberIds,
 } from './store.ts'
@@ -213,13 +213,34 @@ bot.command('mode', async ctx => {
   const s = sess(ctx)
   try { await s.ensure() } catch (e) { await ctx.reply(`⚠️ ${e instanceof Error ? e.message : e}`); return }
   const c = s.config.find(x => x.id === 'mode')
-  const yolo = s.state.yolo === true
+  const perm = s.state.permission ?? 'request-review'
   const kb = new InlineKeyboard()
-  ;(c?.options ?? []).forEach((o, i) => kb.text(`${!yolo && o.value === c!.currentValue ? '• ' : ''}${o.name}`, `cf:mode:${i}`))
-  kb.row().text(`${yolo ? '• ' : ''}⚡ Auto (no permission prompts)`, 'yo:on')
-  const cur = yolo ? 'Auto: everything is approved without asking' : (c?.options.find(o => o.value === c.currentValue)?.name ?? 'default')
-  await ctx.reply(`Mode: ${cur}\n\nDefault asks before edits and commands. Accept edits approves file edits. Plan plans first. Auto approves everything (restarts agy, keeps the chat).`, { reply_markup: kb })
+  ;(c?.options ?? []).forEach((o, i) => kb.text(`${o.value === c!.currentValue ? '• ' : ''}${o.name}`, `cf:mode:${i}`))
+  kb.row()
+  PERMISSIONS.forEach((p, i) => { kb.text(`${p.value === perm ? '• ' : ''}${p.label}`, `tp:${i}`); if (i % 2) kb.row() })
+  const modeName = c?.options.find(o => o.value === c.currentValue)?.name ?? 'Default'
+  await sendRich(bot, chatId(ctx), [
+    `**Agent mode:** ${modeName} · **Tool permission:** ${PERMISSIONS.find(p => p.value === perm)?.label ?? perm}`, '',
+    '**Agent mode** (first row): *Default* asks per your tool permission · *Accept edits* approves file edits · *Plan* researches and plans without changes.',
+    '**Tool permission** (agy\'s setting): *Ask me* · *Turbo* runs every command without asking · *Sandbox* runs commands in a restricted sandbox · *Strict* read-only. Changing it restarts your agy (chat kept).',
+  ].join('\n'), { reply_markup: kb })
 })
+bot.command(['permission', 'turbo'], async ctx => {
+  if (!gate(ctx)) return
+  const want = arg(ctx).toLowerCase() || (ctx.message?.text?.startsWith('/turbo') ? 'turbo' : '')
+  const p = PERMISSIONS.find(x => x.short === want || x.value === want)
+  if (!p) { await ctx.reply(`Usage: /permission ask | turbo | sandbox | strict\nNow: ${sess(ctx).state.permission ?? 'request-review'}`); return }
+  await setPermission(ctx, p.value)
+})
+async function setPermission(ctx: Context, value: string): Promise<void> {
+  const s = sess(ctx)
+  const p = PERMISSIONS.find(x => x.value === value)!
+  if ((s.state.permission ?? 'request-review') === value) { await ctx.reply(`Already: ${p.label}`); return }
+  if (s.busy) { await ctx.reply('⏳ agy is working. /stop first.'); return }
+  saveAccount(uid(ctx), { permission: value })
+  await ctx.reply(`${p.label}: restarting your agy (chat kept)…`)
+  try { await s.restart(); await ctx.reply(`✅ Tool permission: ${p.label}`) } catch (e) { await ctx.reply(`⚠️ ${e instanceof Error ? e.message : e}`) }
+}
 
 function listProjects(): string[] {
   const out: string[] = []
@@ -322,7 +343,7 @@ bot.command('status', async ctx => {
   const s = sess(ctx)
   const st = s.state
   const think = s.config.find(c => c.id === 'thought_level')?.currentValue ?? st.thought ?? ''
-  const mode = st.yolo ? 'auto (no prompts)' : (s.config.find(c => c.id === 'mode')?.currentValue ?? st.mode ?? 'default')
+  const mode = `${s.config.find(c => c.id === 'mode')?.currentValue ?? st.mode ?? 'default'} · tools: ${PERMISSIONS.find(p => p.value === (st.permission ?? 'request-review'))?.label}`
   let rss = ''
   if (s.acp?.pid) { const r = await run('ps', ['-o', 'rss=', '-p', String(s.acp.pid)], '/'); rss = r.code === 0 ? ` · ${Math.round(Number(r.out.trim()) / 1024)} MB` : '' }
   await sendRich(bot, chatId(ctx), [
@@ -418,7 +439,7 @@ bot.command('help', async ctx => {
     'Messages go to **your own agy session** on the server (each account has its own, like separate terminals). Photos are sent as images; files are saved and their path passed on.',
     '',
     '**Chat:** /new · /resume (`/resume all` for every folder) · /stop (or the Stop button) · /project',
-    '**agy settings:** /model · /think (thinking level) · /mode (default, accept edits, plan, auto) · /config · /restart',
+    '**agy settings:** /model · /think (thinking level) · /mode (agent mode + tool permission) · /turbo · /permission ask|turbo|sandbox|strict · /config · /restart',
     '**agy tools:** /mcp · /plugins · /agents · /models · /changelog (add arguments to pass them on, e.g. `/mcp disable github`)',
     '**See what happened:** /steps · /diff · /status · /usage · /sessions · /live',
     '**Shell:** `!git status` runs directly on the server',
@@ -451,23 +472,15 @@ bot.on('callback_query:data', async ctx => {
       const c = s.config.find(x => x.id === m![1])
       const o = c?.options[Number(m[2])]
       if (!c || !o) { await ctx.reply('That option is gone. Send the command again.'); return }
-      if (c.id === 'mode' && s.state.yolo) {
-        saveAccount(me, { yolo: false })
-        await ctx.reply('♻️ Leaving auto mode: restarting agy with permission prompts (chat kept)…')
-        await s.restart()
-      }
       await s.setConfig(c.id, o.value)
       await ctx.reply(`${c.name}: ${o.name}`)
     } catch (e) { await ctx.reply(`⚠️ ${e instanceof Error ? e.message : e}`) }
     return
   }
-  if (data === 'yo:on') {
+  if ((m = /^tp:(\d+)$/.exec(data))) {
+    const p = PERMISSIONS[Number(m[1])]
     await done(); await clearKb()
-    if (s.state.yolo) { await ctx.reply('Already in auto mode.'); return }
-    if (s.busy) { await ctx.reply('⏳ agy is working. /stop first.'); return }
-    saveAccount(me, { yolo: true })
-    await ctx.reply('⚡ Auto mode: restarting agy so it approves every command and edit without asking (chat kept)…')
-    try { await s.restart(); await ctx.reply('✅ Auto mode is on. /mode to go back.') } catch (e) { await ctx.reply(`⚠️ ${e instanceof Error ? e.message : e}`) }
+    if (p) await setPermission(ctx, p.value)
     return
   }
   if ((m = /^rs:(\d+)$/.exec(data))) {
@@ -574,13 +587,14 @@ bot.on('message', async ctx => {
   }
   if (text.trim()) blocks.push({ type: 'text', text })
   if (!blocks.length) return
-  await mgr.get(uid(ctx)).prompt(chat, blocks)
+  // Don't await: grammY handles updates one at a time, and the turn may wait for a button press.
+  void mgr.get(uid(ctx)).prompt(chat, blocks).catch(e => log('prompt failed', e))
 })
 
 // --- command menu ------------------------------------------------------------------------
 const BOT_COMMANDS = [
   ['new', 'Start a new chat'], ['resume', 'Open a previous chat'], ['stop', 'Stop what agy is doing'],
-  ['model', 'Choose the model'], ['think', 'Thinking level (low/medium/high)'], ['mode', 'Default / accept edits / plan / auto'],
+  ['model', 'Choose the model'], ['think', 'Thinking level (low/medium/high)'], ['mode', 'Agent mode and tool permission (turbo)'], ['turbo', 'Run commands without asking'],
   ['project', 'Switch folder'], ['steps', 'Steps of the last turn, with outputs'], ['diff', 'Uncommitted changes'],
   ['status', 'Folder, model, mode, chat'], ['sessions', 'Who is running what'], ['mcp', 'agy MCP servers'],
   ['plugins', 'agy plugins'], ['agents', 'agy agents'], ['config', 'agy settings'], ['restart', 'Restart your agy process'],

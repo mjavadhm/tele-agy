@@ -19,7 +19,7 @@ export type AccountState = {
   model?: string
   thought?: string
   mode?: string
-  yolo?: boolean // --dangerously-skip-permissions (no permission prompts)
+  permission?: string // agy toolPermission: request-review | always-proceed (turbo) | proceed-in-sandbox | strict-mode
   live?: boolean
 }
 

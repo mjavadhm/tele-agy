@@ -16,8 +16,10 @@ output, plans and permission requests.
   draft has Telegram's Stop button.
 - **Permission prompts as buttons.** You get the Allow/Deny options agy itself offers.
 - **Terminal controls:**
-  - `/model`, `/think` (thinking level) and `/mode` (default, accept edits, plan, or auto with no
-    prompts)
+  - `/model`, `/think` (thinking level) and `/mode` (agent mode: default, accept edits or plan)
+  - **Tool permission**, agy's own setting: ask me, ⚡ **turbo** (always proceed), sandbox, or
+    strict. Use `/mode` buttons, `/turbo` or `/permission`. It is written to agy's `settings.json`
+    just before that account's agy starts, so each account keeps its own choice
   - `/new`, `/resume` (`/resume all` covers every folder) and `/project`
   - `/restart` and `/config` (agy's `settings.json`)
 - **agy's own commands** (`/goal`, `/compact`, `/plan`, `/browser`, `/teamwork` …) are sent to agy
@@ -76,7 +78,7 @@ which is not tracked by git.
 ## Security
 
 - Anyone you invite can make agy run commands on your server, and can use `!` shell directly.
-- In auto mode agy runs everything without asking.
+- In turbo mode agy runs everything without asking.
 - Only invite people you trust with that access.
 
 ## License

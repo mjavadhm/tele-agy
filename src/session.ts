@@ -4,10 +4,29 @@ import { Bot, InlineKeyboard } from 'grammy'
 import { randomBytes } from 'crypto'
 import { Acp, type PermissionRequest, type SessionUpdate } from './acp.ts'
 import { sendRich, sendDraft, fence, clip } from './rich.ts'
-import { existsSync } from 'fs'
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs'
+import { join } from 'path'
 import { loadAccount, saveAccount, loadShared, DEFAULT_CWD, type AccountState } from './store.ts'
 
 export const AGY_BIN = process.env.AGY_BIN ?? `${process.env.HOME ?? '/root'}/.local/bin/agy`
+export const AGY_SETTINGS = join(process.env.HOME ?? '/root', '.gemini', 'antigravity-cli', 'settings.json')
+/** agy's "Tool Permission" setting (same values as its /config panel). */
+export const PERMISSIONS = [
+  { value: 'request-review', label: '🛡 Ask me (request review)', short: 'ask' },
+  { value: 'always-proceed', label: '⚡ Turbo (always proceed)', short: 'turbo' },
+  { value: 'proceed-in-sandbox', label: '📦 Run in sandbox', short: 'sandbox' },
+  { value: 'strict-mode', label: '🔒 Strict (read-only)', short: 'strict' },
+]
+// agy has no per-session flag for this; it reads settings.json when it starts, so we write the
+// account's choice there just before starting that account's agy process.
+function writeToolPermission(value: string): void {
+  let cur: any = {}
+  try { cur = JSON.parse(readFileSync(AGY_SETTINGS, 'utf8')) } catch {}
+  if (cur.toolPermission === value) return
+  cur.toolPermission = value
+  mkdirSync(join(AGY_SETTINGS, '..'), { recursive: true })
+  writeFileSync(AGY_SETTINGS, JSON.stringify(cur, null, 2) + '\n')
+}
 const DRAFT_EVERY_MS = 1200
 const DRAFT_REFRESH_MS = 20_000 // drafts expire after ~30 s; keep them alive
 
@@ -118,7 +137,8 @@ export class AgentSession {
     await this.mgr.makeRoom(this)
     const st = this.state
     const cwd = existsSync(st.cwd) ? st.cwd : DEFAULT_CWD
-    const acp = new Acp(AGY_BIN, st.yolo ? ['--dangerously-skip-permissions'] : [], s => log(`[${this.account}]`, s), cwd)
+    writeToolPermission(st.permission ?? 'request-review')
+    const acp = new Acp(AGY_BIN, [], s => log(`[${this.account}]`, s), cwd)
     acp.onUpdate = (sid, u) => this.onUpdate(sid, u)
     acp.onPermission = p => this.askPermission(p)
     acp.onExit = code => {
