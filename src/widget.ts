@@ -83,9 +83,10 @@ export function groupOf(q: Quota, model: string): number {
   return q.groups.findIndex(g => g.models.split(',').some(m => { const w = words(m); return w.length > 0 && w.every(x => have.has(x)) }))
 }
 const left = (g: QuotaGroup) => Math.min(...g.limits.map(l => l.pct))
+export const nearlyOut = (q: Quota, gi: number) => gi >= 0 && gi < q.groups.length && left(q.groups[gi]!) < 10
 /** When this chat's group is nearly out (<10% on any limit), the best other group (≥20% on all) and a model in it. */
 export function switchOffer(q: Quota, cur: number, options: { value: string; name: string }[]): [number, { value: string; name: string }] | null {
-  if (cur < 0 || left(q.groups[cur]!) >= 10) return null
+  if (!nearlyOut(q, cur)) return null
   const rank = (o: { name: string }) => { const w = words(o.name); return (w.includes('pro') ? 3 : w.includes('sonnet') ? 2 : 1) - (w.includes('thinking') ? 0.5 : 0) }
   const order = q.groups.map((g, i) => i).filter(i => i !== cur && left(q.groups[i]!) >= 20).sort((a, b) => left(q.groups[b]!) - left(q.groups[a]!))
   for (const gi of order) {
@@ -168,7 +169,7 @@ st.g.forEach(function(g,gi){
 h+='<div class="g"><div class="gn">'+esc(g.n)+(st.c===gi?' <span class="cur">● you: '+esc(st.cm)+'</span>':'')+'</div>'+(g.m?'<div class="mu">'+esc(g.m)+'</div>':'')+'<div class="pies">';
 g.l.slice().reverse().forEach(function(l){
 var p=l[1],c=p<20?'low':p<50?'mid':'ok';
-h+='<div class="c"><div class="pie '+c+'"><svg viewBox="0 0 64 64"><circle class="t" cx="32" cy="32" r="28.5"/>'+(p>0?'<circle class="a" cx="32" cy="32" r="28.5" transform="rotate(-90 32 32)" style="stroke-dasharray:'+(Math.min(100,p)*1.7907).toFixed(1)+' 200"/>':'')+'</svg><div class="in">'+(l[2]>=0?'<span class="mu">resets</span><b>'+dur(l[2]-el)+'</b>':'<b>—</b>')+'</div></div><div><div class="mu">'+esc(l[0])+'</div><div class="p">'+(p>=10?Math.round(p):p.toFixed(1))+'%</div>'+fc(l[3],el)+'</div></div>'});
+h+='<div class="c"><div class="pie '+c+'"><svg viewBox="0 0 64 64"><circle class="t" cx="32" cy="32" r="28.5"/>'+(p>0?'<circle class="a" cx="32" cy="32" r="28.5" transform="rotate(-90 32 32)" style="stroke-dasharray:'+Math.max(.01,Math.min(100,p)*1.7907-7).toFixed(2)+' 200;stroke-dashoffset:-3.5"/>':'')+'</svg><div class="in">'+(l[2]>=0?'<span class="mu">resets</span><b>'+dur(l[2]-el)+'</b>':'<b>—</b>')+'</div></div><div><div class="mu">'+esc(l[0])+'</div><div class="p">'+(p>=10?Math.round(p):p.toFixed(1))+'%</div>'+fc(l[3],el)+'</div></div>'});
 h+='</div>';
 h+='</div>'});
 if(st.w)h+='<div class="sw"><span class="mu">'+esc(st.g[st.c].n)+' is almost out.</span><button onclick="sw()"'+(busy?' disabled':'')+'>Switch to '+esc(st.w[1])+'</button></div>';

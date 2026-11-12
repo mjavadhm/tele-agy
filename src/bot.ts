@@ -10,7 +10,7 @@ import { homedir } from 'os'
 import { sendRich, fence, clip, threadOpt, type Dest } from './rich.ts'
 import { SessionManager, AgentSession, stepsMd, AGY_BIN, PERMISSIONS, screenAnsi } from './session.ts'
 import { runTuiCommand } from './tui.ts'
-import { parseQuota, quotaMd, quotaCaption, widgetState, errorState, groupOf, switchOffer, sampleOf, forecast, USAGE_HTML, type Quota, type Sample } from './widget.ts'
+import { parseQuota, quotaMd, quotaCaption, widgetState, errorState, groupOf, switchOffer, nearlyOut, sampleOf, forecast, USAGE_HTML, type Quota, type Sample } from './widget.ts'
 import { scan, older, remove, human, summary } from './cleanup.ts'
 import { userMessages } from './import.ts'
 import { parseArgs, createProject, NEWPROJECT_HELP, PROJECTS_BASE } from './newproject.ts'
@@ -597,8 +597,11 @@ setInterval(() => {
 }, 15 * 60_000)
 
 const modelOpt = (s: AgentSession) => s.config.find(c => c.id === 'model')
-function cardState(q: Quota, key: string, note?: string): string {
+async function cardState(q: Quota, key: string, note?: string): Promise<string> {
   const s = mgr.get(key), t = s.tokens
+  // agy reports its model list only once it runs: start it when the card may need to offer a switch.
+  if (!modelOpt(s) && nearlyOut(q, groupOf(q, s.state.model ?? '')))
+    await s.ensure().catch(e => log('usage card: start agy', e))
   const model = modelOpt(s) ? modelName(s) : (s.state.model ?? '')
   const cur = model ? groupOf(q, model) : -1
   const offer = switchOffer(q, cur, modelOpt(s)?.options ?? [])
@@ -608,7 +611,7 @@ function cardState(q: Quota, key: string, note?: string): string {
   })
 }
 async function sendUsageWidget(ctx: Context, q: Quota): Promise<void> {
-  const key = keyFor(ctx), state = cardState(q, key), caption = quotaCaption(q)
+  const key = keyFor(ctx), state = await cardState(q, key), caption = quotaCaption(q)
   const m = await (bot.api.raw as any).sendWidget({
     chat_id: Number(chatId(ctx)), ...threadOpt(dest(ctx)), html: USAGE_HTML, chat_data: state, caption, allow_queries: true,
   })
@@ -627,7 +630,7 @@ async function updateCard(chat: number, message_id: number, from: string, work?:
   try {
     const q = await readQuota()
     const note = work ? await work(card.key, q) : undefined
-    card.state = cardState(q, card.key, note)
+    card.state = await cardState(q, card.key, note)
     await edit(card.state)
     const caption = quotaCaption(q)
     if (caption !== card.caption) {
