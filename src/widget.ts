@@ -81,8 +81,10 @@ button{padding:4px 10px;font-size:.85em;border-radius:14px;flex:none}
 .gn{font-weight:600}
 .pies{display:flex;gap:10px;margin-top:6px}
 .c{flex:1;display:flex;align-items:center;gap:8px;min-width:0}
-.pie{position:relative;width:64px;height:64px;border-radius:50%;flex:none;background:conic-gradient(var(--k) calc(var(--p)*1%),var(--tg-theme-secondary-bg-color) 0)}
-.in{position:absolute;top:7px;left:7px;right:7px;bottom:7px;border-radius:50%;background:var(--tg-theme-bg-color);display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;line-height:1.1;font-size:.72em;font-variant-numeric:tabular-nums}
+.pie{position:relative;width:64px;height:64px;flex:none}
+.pie svg{position:absolute;top:0;left:0;width:64px;height:64px}
+.pie circle{fill:none;stroke-width:7}.pie .t{stroke:var(--tg-theme-secondary-bg-color)}.pie .a{stroke:var(--k);stroke-linecap:round}
+.in{position:absolute;top:7px;left:7px;right:7px;bottom:7px;border-radius:50%;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;line-height:1.1;font-size:.72em;font-variant-numeric:tabular-nums}
 .in b{font-size:1.15em}
 .ok{--k:var(--tg-theme-button-color)}.mid{--k:light-dark(#c77c00,#f0a830)}.low{--k:var(--tg-theme-destructive-text-color)}
 .p{font-variant-numeric:tabular-nums;font-weight:600;font-size:1.15em}
@@ -107,7 +109,7 @@ st.g.forEach(function(g){
 h+='<div class="g"><div class="gn">'+esc(g.n)+'</div>'+(g.m?'<div class="mu">'+esc(g.m)+'</div>':'')+'<div class="pies">';
 g.l.slice().reverse().forEach(function(l){
 var p=l[1],c=p<20?'low':p<50?'mid':'ok';
-h+='<div class="c"><div class="pie '+c+'" style="--p:'+Math.max(0,Math.min(100,p))+'"><div class="in">'+(l[2]>=0?'<span class="mu">resets</span><b>'+dur(l[2]-el)+'</b>':'<b>—</b>')+'</div></div><div><div class="mu">'+esc(l[0])+'</div><div class="p">'+(p>=10?Math.round(p):p.toFixed(1))+'%</div><div class="mu">left</div></div></div>'});
+h+='<div class="c"><div class="pie '+c+'"><svg viewBox="0 0 64 64"><circle class="t" cx="32" cy="32" r="28.5"/>'+(p>0?'<circle class="a" cx="32" cy="32" r="28.5" transform="rotate(-90 32 32)" style="stroke-dasharray:'+(Math.min(100,p)*1.7907).toFixed(1)+' 200"/>':'')+'</svg><div class="in">'+(l[2]>=0?'<span class="mu">resets</span><b>'+dur(l[2]-el)+'</b>':'<b>—</b>')+'</div></div><div><div class="mu">'+esc(l[0])+'</div><div class="p">'+(p>=10?Math.round(p):p.toFixed(1))+'%</div><div class="mu">left</div></div></div>'});
 h+='</div>';
 h+='</div>'});
 var a=el<90?'just now':el<5400?Math.round(el/60)+' min ago':Math.round(el/3600)+' h ago';
