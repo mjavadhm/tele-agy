@@ -10,7 +10,7 @@ import { homedir } from 'os'
 import { sendRich, fence, clip, threadOpt, type Dest } from './rich.ts'
 import { SessionManager, AgentSession, stepsMd, AGY_BIN, PERMISSIONS, screenAnsi } from './session.ts'
 import { runTuiCommand } from './tui.ts'
-import { parseQuota, quotaMd, quotaCaption, widgetState, errorState, USAGE_HTML, type Quota } from './widget.ts'
+import { parseQuota, quotaMd, quotaCaption, widgetState, errorState, groupOf, switchOffer, sampleOf, forecast, USAGE_HTML, type Quota, type Sample } from './widget.ts'
 import { scan, older, remove, human, summary } from './cleanup.ts'
 import { userMessages } from './import.ts'
 import { parseArgs, createProject, NEWPROJECT_HELP, PROJECTS_BASE } from './newproject.ts'
@@ -563,43 +563,95 @@ bot.command('status', async ctx => {
   ].join('\n'))
 })
 // --- agy terminal-only commands (/usage, /credits, /skills …), via a hidden agy terminal ------
-// /usage as a widget: a card with bars and a Refresh button (Bot API 10.4). The refresh tap arrives
-// as a widget_query; we answer at once (15 s limit), read agy's quota, then rewrite the card's state.
-const usageCards = new Map<string, { key: string; state: string; caption: string; running?: boolean }>() // by "chat:message"
-const tokensOf = (key: string): [number, number, number] => { const t = mgr.get(key).tokens; return [t.input, t.output, t.turns] }
+// /usage as a widget: a card with rings, a forecast and a Refresh button (Bot API 10.4). Taps arrive
+// as widget_query updates; we answer at once (15 s limit), do the work, then rewrite the card's state.
+type Card = { key: string; state: string; caption: string; running?: boolean; note?: string }
+const CARDS_FILE = join(DATA, 'usage-cards.json'), HISTORY_FILE = join(DATA, 'quota-history.json')
+const readJson = <T,>(f: string, d: T): T => { try { return JSON.parse(readFileSync(f, 'utf8')) } catch { return d } }
+const usageCards = new Map<string, Card>(Object.entries(readJson<Record<string, Card>>(CARDS_FILE, {}))) // by "chat:message"
+function saveCards(): void {
+  const keep = [...usageCards].slice(-100).map(([k, c]) => [k, { key: c.key, state: c.state, caption: c.caption }])
+  try { writeFileSync(CARDS_FILE, JSON.stringify(Object.fromEntries(keep))) } catch (e) { log('save usage cards', e) }
+}
+let quotaHistory: Sample[] = readJson<Sample[]>(HISTORY_FILE, [])
+/** Read agy's quota and remember it (the last 24 h of readings make the forecast). */
+async function readQuota(): Promise<Quota> {
+  const r = await runTuiCommand('/usage')
+  const q = parseQuota(r.text)
+  if (!q) throw new Error(`could not read agy's quota screen${r.text.trim() ? '' : ' (empty)'}`)
+  rememberQuota(q)
+  return q
+}
+function rememberQuota(q: Quota): void {
+  const now = Math.floor(Date.now() / 1000)
+  quotaHistory = [...quotaHistory.filter(x => now - x.t < 86400), sampleOf(q, now)].slice(-500)
+  try { writeFileSync(HISTORY_FILE, JSON.stringify(quotaHistory)) } catch (e) { log('save quota history', e) }
+}
+// Keep the history going while people use agy: a reading every 15 min, only if some chat ran a turn since the last one.
+let turnsAtSample = -1
+setInterval(() => {
+  const turns = [...mgr.sessions.values()].reduce((n, s) => n + s.tokens.turns, 0)
+  if (turns === turnsAtSample) return
+  turnsAtSample = turns
+  void readQuota().catch(e => log('quota sample', e))
+}, 15 * 60_000)
+
+const modelOpt = (s: AgentSession) => s.config.find(c => c.id === 'model')
+function cardState(q: Quota, key: string, note?: string): string {
+  const s = mgr.get(key), t = s.tokens
+  const model = modelOpt(s) ? modelName(s) : (s.state.model ?? '')
+  const cur = model ? groupOf(q, model) : -1
+  const offer = switchOffer(q, cur, modelOpt(s)?.options ?? [])
+  return widgetState(q, {
+    tokens: [t.input, t.output, t.turns], cur, model, note, forecast: forecast(q, quotaHistory),
+    ...(offer ? { offer: [offer[0], offer[1].name] } : {}),
+  })
+}
 async function sendUsageWidget(ctx: Context, q: Quota): Promise<void> {
-  const key = keyFor(ctx), state = widgetState(q, tokensOf(key)), caption = quotaCaption(q)
+  const key = keyFor(ctx), state = cardState(q, key), caption = quotaCaption(q)
   const m = await (bot.api.raw as any).sendWidget({
     chat_id: Number(chatId(ctx)), ...threadOpt(dest(ctx)), html: USAGE_HTML, chat_data: state, caption, allow_queries: true,
   })
   usageCards.set(`${chatId(ctx)}:${m.message_id}`, { key, state, caption })
+  saveCards()
 }
-async function refreshUsageCard(chat: number, message_id: number, from: string): Promise<void> {
+/** Run `work` for a card (one at a time), then rewrite the card from a fresh quota reading. */
+async function updateCard(chat: number, message_id: number, from: string, work?: (key: string, q: Quota) => Promise<string>): Promise<void> {
   const id = `${chat}:${message_id}`
   const card = usageCards.get(id) ?? { key: keyOf(from, undefined), state: '', caption: '' }
   usageCards.set(id, card)
-  if (card.running) return // the card updates when the refresh already running lands
+  if (card.running) return // the card updates when the job already running lands
   card.running = true
   const edit = (chat_data: string) => (bot.api.raw as any).editMessageWidgetData({ chat_id: chat, message_id, chat_data })
     .catch((e: any) => { if (!/not modified/.test(String(e))) throw e })
   try {
-    const r = await runTuiCommand('/usage')
-    const q = parseQuota(r.text)
-    if (!q) throw new Error('could not read agy\'s quota screen')
-    card.state = widgetState(q, tokensOf(card.key))
+    const q = await readQuota()
+    const note = work ? await work(card.key, q) : undefined
+    card.state = cardState(q, card.key, note)
     await edit(card.state)
     const caption = quotaCaption(q)
     if (caption !== card.caption) {
       card.caption = caption
       await bot.api.editMessageCaption(chat, message_id, { caption }).catch(() => {})
     }
+    saveCards()
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
-    log('usage refresh failed', msg)
+    log('usage card failed', msg)
     let prev: any = null
     try { prev = JSON.parse(card.state) } catch {}
-    await edit(prev?.g ? JSON.stringify({ ...prev, e: msg.slice(0, 200) }) : errorState(msg)).catch(e2 => log('usage card edit failed', e2))
+    await edit(prev?.g ? JSON.stringify({ ...prev, s: undefined, e: msg.slice(0, 200) }) : errorState(msg)).catch(e2 => log('usage card edit failed', e2))
   } finally { card.running = false }
+}
+/** The card's "Switch to …" button: move this chat to a model in group `gi` (checked again here). */
+const switchTo = (gi: number) => async (key: string, q: Quota): Promise<string> => {
+  const s = mgr.get(key)
+  await s.ensure()
+  const cur = groupOf(q, modelName(s))
+  const offer = switchOffer(q, cur, modelOpt(s)?.options ?? [])
+  if (!offer || offer[0] !== gi) throw new Error('No switch needed any more.')
+  await s.setConfig('model', offer[1].value)
+  return `Switched this chat to ${offer[1].name}`
 }
 bot.use(async (ctx, next) => {
   const q = (ctx.update as any).widget_query
@@ -607,10 +659,11 @@ bot.use(async (ctx, next) => {
   const answer = (data?: string) => (bot.api.raw as any).answerWidgetQuery({ widget_query_id: q.id, ...(data ? { data } : {}) }).catch((e: any) => log('answerWidgetQuery', e))
   const from = String(q.from?.id ?? '')
   if (!isMember(from)) { await answer('e:Not authorized.'); return }
-  if (q.data !== 'r' || !q.chat || !q.message_id) { await answer('e:Unknown request.'); return }
+  const m = /^(r|m:(\d))$/.exec(q.data ?? '')
+  if (!m || !q.chat || !q.message_id) { await answer('e:Unknown request.'); return }
   await answer()
   // Not awaited: grammy handles updates one at a time, and reading the quota takes ~15 s.
-  void refreshUsageCard(q.chat.id, q.message_id, from).catch(e => log('usage refresh', e))
+  void updateCard(q.chat.id, q.message_id, from, m[2] != null ? switchTo(Number(m[2])) : undefined).catch(e => log('usage card', e))
 })
 async function tuiCommand(ctx: Context, cmd: string, title: string, legacy = false): Promise<void> {
   if (!gate(ctx)) return
@@ -622,6 +675,7 @@ async function tuiCommand(ctx: Context, cmd: string, title: string, legacy = fal
       const s = sess(ctx)
       const q = parseQuota(body)
       if (q) {
+        rememberQuota(q)
         if (!legacy && await sendUsageWidget(ctx, q).then(() => true, e => { log('sendWidget failed, sending text', e); return false })) return
         await sendRich(bot, dest(ctx), quotaMd(q, `${s.tokens.input.toLocaleString()} input · ${s.tokens.output.toLocaleString()} output tokens in ${s.tokens.turns} turns`))
         return
