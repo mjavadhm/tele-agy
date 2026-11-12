@@ -44,6 +44,17 @@ export type Dest = { chat_id: string; thread?: number }
 export const threadOpt = (d: Dest | string) => typeof d !== 'string' && d.thread ? { message_thread_id: d.thread } : {}
 const chatOf = (d: Dest | string) => typeof d === 'string' ? d : d.chat_id
 
+/** Run a Telegram call; if Telegram says "too many requests", wait as long as it asks and try again. */
+async function patient<T>(call: () => Promise<T>): Promise<T> {
+  for (let i = 0; ; i++) {
+    try { return await call() } catch (e: any) {
+      const wait = e?.error_code === 429 ? Number(e.parameters?.retry_after ?? 1) : 0
+      if (!wait || i >= 3 || wait > 60) throw e
+      await new Promise(r => setTimeout(r, wait * 1000 + 250))
+    }
+  }
+}
+
 export async function sendRich(
   bot: Bot,
   dest: Dest | string,
@@ -61,17 +72,17 @@ export async function sendRich(
       ...(last && opts.reply_markup ? { reply_markup: opts.reply_markup } : {}),
     }
     try {
-      const m = await (bot.api.raw as any).sendRichMessage({ chat_id, rich_message: { markdown: richEscape(parts[i]!) }, ...extra })
+      const m = await patient(() => (bot.api.raw as any).sendRichMessage({ chat_id, rich_message: { markdown: richEscape(parts[i]!) }, ...extra })) as any
       ids.push(m.message_id)
     } catch (err) {
       console.error(`rich send failed, falling back to plain: ${err}`)
       const plain = chunk(parts[i]!, MAX_CHUNK_LIMIT, 'newline')
       for (let j = 0; j < plain.length; j++) {
-        const m = await bot.api.sendMessage(chat_id, plain[j]!, {
+        const m = await patient(() => bot.api.sendMessage(chat_id, plain[j]!, {
           ...threadOpt(dest),
           ...(i === 0 && j === 0 && opts.reply_to != null ? { reply_parameters: { message_id: opts.reply_to } } : {}),
           ...(last && j === plain.length - 1 && opts.reply_markup ? { reply_markup: opts.reply_markup } : {}),
-        })
+        }))
         ids.push(m.message_id)
       }
     }
