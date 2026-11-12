@@ -156,15 +156,38 @@ bot.command('users', async ctx => {
 // --- topics: one chat per topic ---------------------------------------------------
 // Topic names are "<project folder> - <chat title>"; the title comes from agy after the first reply.
 const topicName = (cwd: string, title?: string) => clip(`${basename(cwd) || cwd} - ${title?.trim() || 'new chat'}`, 120)
-mgr.onRename = s => {
-  if (!s.thread) return
-  const st = s.state
-  if (st.manualName) return
-  const name = topicName(s.cwd || st.cwd, s.title)
-  if (st.topicName === name) return
-  saveAccount(s.key, { topicName: name })
-  void bot.api.editForumTopic(Number(s.account), s.thread, { name }).catch(e => log(`rename topic ${s.key}: ${e}`))
+// Topic icons: Telegram allows a fixed set of emoji (getForumTopicIconStickers), no photos. Every
+// topic of one project gets the same icon: the one picked with /icon, else one chosen by its name.
+const ICONS: [string, string][] = [
+  ['💻', '5350554349074391003'], ['🤖', '5309832892262654231'], ['⚡️', '5312016608254762256'], ['💡', '5312536423851630001'],
+  ['🔥', '5312241539987020022'], ['💎', '5309958691854754293'], ['🧠', '5237889595894414384'], ['🧪', '5411138633765757782'],
+  ['🔬', '5377580546748588396'], ['🔭', '5368585403467048206'], ['🎮', '5309950797704865693'], ['🎨', '5310039132297242441'],
+  ['📱', '5409357944619802453'], ['📈', '5350305691942788490'], ['💰', '5350452584119279096'], ['🛒', '5431492767249342908'],
+  ['📚', '5350481781306958339'], ['📝', '5373251851074415873'], ['📁', '5357315181649076022'], ['🔎', '5309965701241379366'],
+  ['💬', '5417915203100613993'], ['🎵', '5310045076531978942'], ['🎬', '5368653135101310687'], ['🏆', '5312315739842026755'],
+  ['⭐️', '5235579393115438657'], ['🦄', '5413625003218313783'], ['🔮', '5350367161514732241'], ['✈️', '5348436127038579546'],
+  ['🏠', '5312486108309757006'], ['☕️', '5350392020785437399'], ['🧮', '5355127101970194557'], ['👑', '5357107601584693888'],
+]
+function iconFor(cwd: string): string {
+  const chosen = loadShared().icons?.[cwd]
+  if (chosen) return chosen
+  let h = 0
+  for (const c of basename(cwd) || cwd) h = (h * 31 + c.charCodeAt(0)) >>> 0
+  return ICONS[h % ICONS.length]![1]
 }
+/** Bring a topic's name and icon in line with its project and chat title. */
+function syncTopic(key: string, cwd: string, title: string): void {
+  const [account, th] = key.split(':')
+  if (!th) return
+  const st = loadAccount(key)
+  const name = st.manualName ? st.topicName : topicName(cwd, title)
+  const icon = iconFor(cwd)
+  if (st.topicName === name && st.icon === icon) return
+  saveAccount(key, { topicName: name, icon })
+  void bot.api.editForumTopic(Number(account), Number(th), { ...(name && name !== st.topicName ? { name } : {}), icon_custom_emoji_id: icon })
+    .catch(e => log(`edit topic ${key}: ${e}`))
+}
+mgr.onRename = s => syncTopic(s.key, s.cwd || s.state.cwd, s.title)
 /** The key (main chat or topic) of this account that holds the given agy chat, if any. */
 function boundKey(account: string, sessionId: string): string | null {
   for (const k of [account, ...topicKeys(account)]) if (loadAccount(k).sessionId === sessionId) return k
@@ -179,11 +202,12 @@ async function openTopic(ctx: Context, cwd: string, chat?: { sessionId: string; 
   const account = uid(ctx)
   const from = loadAccount(keyFor(ctx))
   const name = topicName(cwd, chat?.title)
-  const t = await bot.api.createForumTopic(Number(account), name)
+  const icon = iconFor(cwd)
+  const t = await bot.api.createForumTopic(Number(account), name, { icon_custom_emoji_id: icon })
   const thread = t.message_thread_id
   const key = keyOf(account, thread)
   saveAccount(key, {
-    cwd, sessionId: chat?.sessionId, title: chat?.title, topicName: name,
+    cwd, sessionId: chat?.sessionId, title: chat?.title, topicName: name, icon,
     model: from.model, thought: from.thought, mode: from.mode, permission: from.permission, live: from.live,
   })
   const d: Dest = { chat_id: account, thread }
@@ -226,6 +250,16 @@ bot.command('topics', async ctx => {
   lines.push('', '_🗑 deletes the topic and its messages in Telegram. The agy chat itself is kept and /resume can open it again._')
   await sendRich(bot, dest(ctx), lines.join('\n'), { reply_markup: kb })
 })
+bot.command('icon', async ctx => {
+  if (!gate(ctx)) return
+  if (!topicsOn) { await ctx.reply('Topics are off for this bot.'); return }
+  const cwd = sess(ctx).cwd || loadAccount(keyFor(ctx)).cwd
+  const cur = iconFor(cwd)
+  const kb = new InlineKeyboard()
+  ICONS.forEach(([e, id], i) => { kb.text(id === cur ? `[${e}]` : e, `ic:${i}`); if (i % 8 === 7) kb.row() })
+  await ctx.reply(`Icon for the topics of ${basename(cwd) || cwd} (now ${ICONS.find(x => x[1] === cur)?.[0] ?? 'custom'}). Pick one:`, { reply_markup: kb })
+})
+
 bot.command('import', async ctx => {
   if (!gate(ctx)) return
   if (!topicsOn) { await ctx.reply('Topics are off for this bot. Turn on topic mode for it in @BotFather, then /restart bot.'); return }
@@ -669,7 +703,7 @@ bot.command('help', async ctx => {
     'Messages go to **your own agy session** on the server (each account has its own, like separate terminals). Photos are sent as images; files are saved and their path passed on.',
     '',
     '**Chat:** /new · /resume (`/resume all` for every folder) · /stop (or the Stop button) · /project · /newproject',
-    ...(topicsOn ? ['**Topics:** each topic is its own chat, named `project - chat title`. /new, /resume, /project and /newproject open a new topic; /topics lists and deletes them; /import makes a topic for each earlier agy chat with more than 3 messages from you (`/import 1` for all). Rename a topic yourself and the bot leaves the name alone.'] : []),
+    ...(topicsOn ? ['**Topics:** each topic is its own chat, named `project - chat title`. /new, /resume, /project and /newproject open a new topic; /topics lists and deletes them; /import makes a topic for each earlier agy chat with more than 3 messages from you (`/import 1` for all). Topics of one project share an icon; /icon changes it. Rename a topic yourself and the bot leaves the name alone.'] : []),
     '**agy settings:** /model · /think (thinking level) · /mode (agent mode + tool permission) · /turbo · /permission ask|turbo|sandbox|strict · /config · /restart',
     '**agy tools:** /mcp · /plugins · /agents · /models · /changelog (add arguments to pass them on, e.g. `/mcp disable github`)',
     '**See what happened:** /screen · /steps · /diff · /status · /sessions · /live',
@@ -760,6 +794,22 @@ bot.on('callback_query:data', async ctx => {
     await done(); await clearKb()
     if (!p) { await ctx.reply('List expired. Send /project again.'); return }
     await switchProject(ctx, p)
+    return
+  }
+  if ((m = /^ic:(\d+)$/.exec(data))) {
+    const pick = ICONS[Number(m[1])]
+    if (!pick) { await done(); return }
+    const cwd = s.cwd || s.state.cwd
+    const sh = loadShared()
+    saveShared({ ...sh, icons: { ...(sh.icons ?? {}), [cwd]: pick[1] } })
+    await done(pick[0]); await clearKb()
+    // Every topic of this project, for every account, follows.
+    let n = 0
+    for (const acc of memberIds()) for (const k of topicKeys(acc)) {
+      const st = loadAccount(k)
+      if (st.cwd === cwd) { syncTopic(k, cwd, st.title ?? ''); n++ }
+    }
+    await ctx.reply(`${pick[0]} is now the icon for ${basename(cwd) || cwd} (${n} topic${n === 1 ? '' : 's'} updated; new ones get it too).`)
     return
   }
   if ((m = /^td:(\d+)$/.exec(data))) {
@@ -880,7 +930,7 @@ const BOT_COMMANDS = [
   ['new', 'Start a new chat'], ['resume', 'Open a previous chat'], ['stop', 'Stop what agy is doing'],
   ['model', 'Choose the model'], ['think', 'Thinking level (low/medium/high)'], ['mode', 'Agent mode and tool permission (turbo)'], ['turbo', 'Run commands without asking'],
   ['project', 'Switch folder'], ['newproject', 'Create a project (optionally from a git repo)'], ['steps', 'Steps of the last turn, with outputs'], ['diff', 'Uncommitted changes'],
-  ['status', 'Folder, model, mode, chat'], ['sessions', 'Who is running what'], ['topics', 'Your topics (one chat each)'], ['import', 'Make topics from your earlier agy chats'], ['mcp', 'agy MCP servers'],
+  ['status', 'Folder, model, mode, chat'], ['sessions', 'Who is running what'], ['topics', 'Your topics (one chat each)'], ['import', 'Make topics from your earlier agy chats'], ['icon', 'Choose the icon for this project\'s topics'], ['mcp', 'agy MCP servers'],
   ['plugins', 'agy plugins'], ['agents', 'agy agents'], ['config', 'agy settings'], ['restart', 'Restart your agy (admin: all, bot, claude)'],
   ['live', 'Toggle live progress'], ['usage', 'agy quota (5-hour and weekly limits)'], ['screen', 'Terminal-style screenshot'], ['credits', 'agy credits'], ['skills', 'agy skills'], ['users', 'Manage accounts (admin)'],
   ['invite', 'Invite another account (admin)'], ['cleanup', 'Delete saved files (admin)'], ['help', 'All commands'],

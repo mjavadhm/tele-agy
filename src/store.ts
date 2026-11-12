@@ -12,6 +12,7 @@ export type Shared = {
   invites?: Record<string, { by: string; exp: number }>
   shell?: boolean
   maxSessions?: number
+  icons?: Record<string, string> // project folder -> topic icon (custom emoji id) chosen with /icon
 }
 export type AccountState = {
   cwd: string
@@ -24,6 +25,7 @@ export type AccountState = {
   title?: string // agy's title of the open chat
   topicName?: string // the Telegram topic's name as we last set it
   manualName?: boolean // the user renamed the topic; don't rename it again
+  icon?: string // the topic's icon (custom emoji id) as we last set it
 }
 
 function readJson<T>(path: string, d: T): T {
@@ -51,7 +53,7 @@ export function loadAccount(key: string): AccountState {
   const { account, thread } = splitKey(key)
   if (!thread) return readJson<AccountState>(accPath(key), { cwd: DEFAULT_CWD, live: true })
   // A topic starts from the account's folder and preferences, with its own chat.
-  const { sessionId: _s, title: _t, topicName: _n, manualName: _m, ...base } = loadAccount(account)
+  const { sessionId: _s, title: _t, topicName: _n, manualName: _m, icon: _i, ...base } = loadAccount(account)
   return readJson<AccountState>(accPath(key), base)
 }
 export function saveAccount(key: string, patch: Partial<AccountState>): AccountState {
