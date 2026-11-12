@@ -79,13 +79,11 @@ button{padding:4px 10px;font-size:.85em;border-radius:14px;flex:none}
 @keyframes r{to{transform:rotate(360deg)}}
 .g{margin-top:10px}
 .gn{font-weight:600}
-.row{display:grid;grid-template-columns:52px 1fr 52px;align-items:center;gap:8px;margin-top:5px}
-.bar{height:8px;border-radius:4px;background:var(--tg-theme-secondary-bg-color);overflow:hidden}
-.bar i{display:block;height:100%;border-radius:4px;background:var(--tg-theme-button-color)}
-.bar i.mid{background:light-dark(#c77c00,#f0a830)}
-.bar i.low{background:var(--tg-theme-destructive-text-color)}
-.p{text-align:right;font-variant-numeric:tabular-nums;font-weight:600}
-.rs{grid-column:2/4;margin-top:-3px}
+.pies{display:flex;gap:10px;margin-top:6px}
+.c{flex:1;display:flex;align-items:center;gap:8px;min-width:0}
+.pie{width:54px;height:54px;border-radius:50%;flex:none;background:conic-gradient(var(--k) calc(var(--p)*1%),var(--tg-theme-secondary-bg-color) 0)}
+.ok{--k:var(--tg-theme-button-color)}.mid{--k:light-dark(#c77c00,#f0a830)}.low{--k:var(--tg-theme-destructive-text-color)}
+.p{font-variant-numeric:tabular-nums;font-weight:600;font-size:1.15em}
 .e{color:var(--tg-theme-destructive-text-color);font-size:.85em;margin-top:8px}
 .f{margin-top:10px;padding-top:6px;border-top:1px solid var(--tg-theme-section-separator-color)}
 </style>
@@ -104,10 +102,11 @@ else{
 var el=now-st.t;
 if(st.a)h+='<div class="mu">'+esc(st.a)+'</div>';
 st.g.forEach(function(g){
-h+='<div class="g"><div class="gn">'+esc(g.n)+'</div>'+(g.m?'<div class="mu">'+esc(g.m)+'</div>':'');
+h+='<div class="g"><div class="gn">'+esc(g.n)+'</div>'+(g.m?'<div class="mu">'+esc(g.m)+'</div>':'')+'<div class="pies">';
 g.l.slice().reverse().forEach(function(l){
-var p=l[1],c=p<20?'low':p<50?'mid':'';
-h+='<div class="row"><span class="mu">'+esc(l[0])+'</span><div class="bar"><i class="'+c+'" style="width:'+Math.max(1,Math.min(100,p))+'%"></i></div><span class="p">'+(p>=10?Math.round(p):p.toFixed(1))+'%</span>'+(l[2]>=0?'<span class="rs mu">resets in '+dur(l[2]-el)+'</span>':'')+'</div>'});
+var p=l[1],c=p<20?'low':p<50?'mid':'ok';
+h+='<div class="c"><div class="pie '+c+'" style="--p:'+Math.max(0,Math.min(100,p))+'"></div><div><div class="mu">'+esc(l[0])+'</div><div class="p">'+(p>=10?Math.round(p):p.toFixed(1))+'%</div>'+(l[2]>=0?'<div class="mu">resets '+dur(l[2]-el)+'</div>':'')+'</div></div>'});
+h+='</div>';
 h+='</div>'});
 var a=el<90?'just now':el<5400?Math.round(el/60)+' min ago':Math.round(el/3600)+' h ago';
 h+='<div class="f mu">'+(st.k?'This run: '+n(st.k[0])+' in · '+n(st.k[1])+' out · '+st.k[2]+' turns<br>':'')+'Updated '+a+'</div>'}
