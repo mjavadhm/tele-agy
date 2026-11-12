@@ -11,6 +11,7 @@ import { sendRich, fence, clip, threadOpt, type Dest } from './rich.ts'
 import { SessionManager, AgentSession, stepsMd, AGY_BIN, PERMISSIONS, screenAnsi } from './session.ts'
 import { runTuiCommand } from './tui.ts'
 import { scan, older, remove, human, summary } from './cleanup.ts'
+import { userMessages } from './import.ts'
 import { parseArgs, createProject, NEWPROJECT_HELP, PROJECTS_BASE } from './newproject.ts'
 import {
   DATA, ROOT, loadShared, saveShared, loadAccount, saveAccount, deleteAccount, topicKeys, keyOf, adminIds, isAdmin, isMember, memberIds,
@@ -174,7 +175,7 @@ const whereIs = (key: string) => {
   return th ? `the topic “${loadAccount(key).topicName ?? th}”: ${topicLink(th)}` : 'the main chat (outside topics)'
 }
 /** Create a topic for a new chat in `cwd`, or for an existing agy chat. */
-async function openTopic(ctx: Context, cwd: string, chat?: { sessionId: string; title?: string }): Promise<void> {
+async function openTopic(ctx: Context, cwd: string, chat?: { sessionId: string; title?: string }, imported = false): Promise<void> {
   const account = uid(ctx)
   const from = loadAccount(keyFor(ctx))
   const name = topicName(cwd, chat?.title)
@@ -186,6 +187,11 @@ async function openTopic(ctx: Context, cwd: string, chat?: { sessionId: string; 
     model: from.model, thought: from.thought, mode: from.mode, permission: from.permission, live: from.live,
   })
   const d: Dest = { chat_id: account, thread }
+  if (chat && imported) {
+    // Many at once: don't start agy for each. It opens the chat on the first message here.
+    await sendRich(bot, d, `📥 **${chat.title || chat.sessionId}**\n📁 \`${cwd}\`\n\nThis is an earlier agy chat. Send a message here to continue it.`)
+    return
+  }
   if (!chat) await sendRich(bot, d, `🆕 **New chat** in \`${cwd}\`\nSend a message here to start. agy starts on your first message.`)
   else {
     // Start agy now so the topic shows where the chat left off.
@@ -219,6 +225,45 @@ bot.command('topics', async ctx => {
   }
   lines.push('', '_🗑 deletes the topic and its messages in Telegram. The agy chat itself is kept and /resume can open it again._')
   await sendRich(bot, dest(ctx), lines.join('\n'), { reply_markup: kb })
+})
+bot.command('import', async ctx => {
+  if (!gate(ctx)) return
+  if (!topicsOn) { await ctx.reply('Topics are off for this bot. Turn on topic mode for it in @BotFather, then /restart bot.'); return }
+  const a = arg(ctx)
+  const min = a ? Number(a) : 4
+  if (!Number.isInteger(min) || min < 1) { await ctx.reply('Usage: /import [n]\nMakes a topic for every saved agy chat in which you sent at least n messages (default 4, i.e. more than 3).'); return }
+  const me = uid(ctx)
+  const s = sess(ctx)
+  let list: { sessionId: string; cwd: string; title?: string; updatedAt?: string }[]
+  try { list = await s.listChats() } catch (e) { await ctx.reply(`⚠️ ${e instanceof Error ? e.message : e}`); return }
+  let have = 0, short = 0, unreadable = 0, locked = 0
+  const todo: typeof list = []
+  for (const x of list) {
+    const n = userMessages(x.sessionId)
+    if (boundKey(me, x.sessionId)) have++
+    else if (n < 0) unreadable++
+    else if (n < min) short++
+    else if (mgr.ownerOf(x.sessionId, s.key)) locked++
+    else todo.push(x)
+  }
+  // Oldest first, so the most recent chat ends up as the newest topic.
+  todo.sort((p, q) => Date.parse(p.updatedAt ?? '') - Date.parse(q.updatedAt ?? ''))
+  const batch = todo.slice(-25)
+  let made = 0
+  const failed: string[] = []
+  for (const x of batch) {
+    try { await openTopic(ctx, x.cwd, x, true); made++ } catch (e) { failed.push(`${x.title || x.sessionId}: ${e instanceof Error ? e.message : e}`) }
+    await Bun.sleep(400) // stay under Telegram's rate limit
+  }
+  const lines = [`📥 Made ${made} topic${made === 1 ? '' : 's'} from ${list.length} saved agy chat${list.length === 1 ? '' : 's'}.`]
+  if (have) lines.push(`• ${have} already in a topic or the main chat`)
+  if (short) lines.push(`• ${short} skipped: fewer than ${min} messages from you (/import ${Math.max(1, min - 1)} lowers the limit)`)
+  if (locked) lines.push(`• ${locked} skipped: open in another account right now`)
+  if (unreadable) lines.push(`• ${unreadable} skipped: couldn't read the chat's file`)
+  if (todo.length > batch.length) lines.push(`• ${todo.length - batch.length} more waiting: send /import again`)
+  if (failed.length) lines.push('', '⚠️ Failed:', ...failed.slice(0, 5))
+  if (made) lines.push('', 'agy starts for a topic when you write in it. /topics lists them.')
+  await ctx.reply(lines.join('\n'))
 })
 
 // --- session commands ------------------------------------------------------------
@@ -624,7 +669,7 @@ bot.command('help', async ctx => {
     'Messages go to **your own agy session** on the server (each account has its own, like separate terminals). Photos are sent as images; files are saved and their path passed on.',
     '',
     '**Chat:** /new · /resume (`/resume all` for every folder) · /stop (or the Stop button) · /project · /newproject',
-    ...(topicsOn ? ['**Topics:** each topic is its own chat, named `project - chat title`. /new, /resume, /project and /newproject open a new topic; /topics lists and deletes them. Rename a topic yourself and the bot leaves the name alone.'] : []),
+    ...(topicsOn ? ['**Topics:** each topic is its own chat, named `project - chat title`. /new, /resume, /project and /newproject open a new topic; /topics lists and deletes them; /import makes a topic for each earlier agy chat with more than 3 messages from you (`/import 1` for all). Rename a topic yourself and the bot leaves the name alone.'] : []),
     '**agy settings:** /model · /think (thinking level) · /mode (agent mode + tool permission) · /turbo · /permission ask|turbo|sandbox|strict · /config · /restart',
     '**agy tools:** /mcp · /plugins · /agents · /models · /changelog (add arguments to pass them on, e.g. `/mcp disable github`)',
     '**See what happened:** /screen · /steps · /diff · /status · /sessions · /live',
@@ -835,7 +880,7 @@ const BOT_COMMANDS = [
   ['new', 'Start a new chat'], ['resume', 'Open a previous chat'], ['stop', 'Stop what agy is doing'],
   ['model', 'Choose the model'], ['think', 'Thinking level (low/medium/high)'], ['mode', 'Agent mode and tool permission (turbo)'], ['turbo', 'Run commands without asking'],
   ['project', 'Switch folder'], ['newproject', 'Create a project (optionally from a git repo)'], ['steps', 'Steps of the last turn, with outputs'], ['diff', 'Uncommitted changes'],
-  ['status', 'Folder, model, mode, chat'], ['sessions', 'Who is running what'], ['topics', 'Your topics (one chat each)'], ['mcp', 'agy MCP servers'],
+  ['status', 'Folder, model, mode, chat'], ['sessions', 'Who is running what'], ['topics', 'Your topics (one chat each)'], ['import', 'Make topics from your earlier agy chats'], ['mcp', 'agy MCP servers'],
   ['plugins', 'agy plugins'], ['agents', 'agy agents'], ['config', 'agy settings'], ['restart', 'Restart your agy (admin: all, bot, claude)'],
   ['live', 'Toggle live progress'], ['usage', 'agy quota (5-hour and weekly limits)'], ['screen', 'Terminal-style screenshot'], ['credits', 'agy credits'], ['skills', 'agy skills'], ['users', 'Manage accounts (admin)'],
   ['invite', 'Invite another account (admin)'], ['cleanup', 'Delete saved files (admin)'], ['help', 'All commands'],

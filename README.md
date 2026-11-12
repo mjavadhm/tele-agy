@@ -15,7 +15,8 @@ output, plans and permission requests.
   each topic in your chat with the bot becomes its own agy chat, so several projects and
   conversations stay side by side. Topics are named `project - chat title`; the bot renames a topic
   when agy titles the chat, unless you renamed it yourself. `/new`, `/resume`, `/project` and
-  `/newproject` open a new topic, and `/topics` lists and deletes them. Each topic that is in use
+  `/newproject` open a new topic, and `/topics` lists and deletes them. `/import` makes a topic for
+  every earlier agy chat with more than 3 messages from you (`/import 1` takes them all). Each topic that is in use
   runs its own agy process, under the same `MAX_SESSIONS` cap; idle ones are stopped and start
   again on the next message. Without topic mode the bot works as before.
 - **Live progress.** The reply streams word by word into a Telegram draft, together with the
