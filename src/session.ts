@@ -1,11 +1,11 @@
 // One agy ACP process + session per Telegram account, or per topic when the bot has topics on. Streams each turn into a live Telegram
 // draft (reply text, thinking, tool steps, plan) and sends the final answer as a rich message.
-import { Bot, InlineKeyboard } from 'grammy'
+import { Bot, InlineKeyboard, InputFile } from 'grammy'
 import { randomBytes } from 'crypto'
 import { Acp, type PermissionRequest, type SessionUpdate } from './acp.ts'
 import { sendRich, sendDraft, fence, clip, threadOpt, type Dest } from './rich.ts'
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs'
-import { join } from 'path'
+import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync } from 'fs'
+import { join, basename } from 'path'
 import { loadAccount, saveAccount, loadShared, splitKey, DEFAULT_CWD, type AccountState } from './store.ts'
 import { KIND_ICON, LIVE_HTML, liveState, type LiveStatus } from './cards/live.ts'
 import { sendCard, editCard, setCaption } from './cards/kit.ts'
@@ -52,6 +52,7 @@ type Turn = {
   lastDraftAt: number
   timer: ReturnType<typeof setInterval>
   usage?: [number, number] // this turn's tokens, when agy reports them
+  msgId?: number
   // The live card (/live widget): its id once sent, the state last written, and when.
   card?: string
   cardState?: string
@@ -59,7 +60,7 @@ type Turn = {
   cardBusy?: Promise<void>
   cardFailed?: boolean // could not send it: this turn uses the draft
 }
-type Queued = { blocks: any[] }
+type Queued = { blocks: any[]; msgId?: number }
 
 const log = (...a: unknown[]) => console.error(new Date().toISOString(), ...a)
 
@@ -259,16 +260,16 @@ export class AgentSession {
   }
 
   // --- turns -----------------------------------------------------------------
-  async prompt(blocks: any[]): Promise<void> {
+  async prompt(blocks: any[], msgId?: number): Promise<void> {
     this.lastUsed = Date.now()
     if (this.turn || this.starting) {
-      this.queue.push({ blocks })
+      this.queue.push({ blocks, msgId })
       if (this.turn) await this.bot.api.sendMessage(this.account, `⏳ Queued (${this.queue.length}). agy is still working; it runs next. /stop cancels the current turn.`, threadOpt(this.dest)).catch(() => {})
       if (this.turn) return
       await this.starting
       return this.drain()
     }
-    this.queue.push({ blocks })
+    this.queue.push({ blocks, msgId })
     return this.drain()
   }
 
@@ -294,6 +295,7 @@ export class AgentSession {
       draftId: 1 + Math.floor(Math.random() * 2_000_000_000), started: Date.now(),
       text: '', thought: '', thinking: true, steps: [], stepById: new Map(), plan: [], lastDraft: '', lastDraftAt: 0,
       timer: setInterval(() => void this.pushDraft(), DRAFT_EVERY_MS),
+      msgId: q.msgId,
     }
     this.turn = t
     void this.pushDraft(true)
@@ -323,9 +325,55 @@ export class AgentSession {
     this.lastUsed = Date.now()
     if (t.steps.length) this.lastSteps = t.steps
     this.lastTurn = { prompt: t.prompt, text: t.text, steps: t.steps, plan: t.plan, note, secs: Math.round((Date.now() - t.started) / 1000) }
+
+    // 1. Reactions on the user's message
+    if (t.msgId) {
+      const emoji = (note && !note.startsWith('✓')) ? '⚠️' : '✅'
+      void this.bot.api.setMessageReaction(this.account, t.msgId, [{ type: 'emoji', emoji }]).catch(() => {})
+    }
+
+    // 2. Scan and send any attached / referenced files
+    const toSend = new Set<string>()
+    const sendFileRe = /(?:\[send_file:\s*([^\s\]]+)\]|<send_file>([^<]+)<\/send_file>|send_file:\s*(\/[^\s\n\r]+))/gi
+    let match: RegExpExecArray | null
+    while ((match = sendFileRe.exec(t.text)) !== null) {
+      const p = (match[1] || match[2] || match[3] || '').trim()
+      if (p) toSend.add(p)
+    }
+
+    const linkRe = /\[[^\]]*\]\((?:file:\/\/)?(\/[^\)\s]+\.(?:png|jpg|jpeg|gif|webp|svg|pdf|zip|tar|gz|txt|csv|json|xlsx|docx|py|sh|html|mp4|mp3|ogg))\)/gi
+    while ((match = linkRe.exec(t.text)) !== null) {
+      const p = (match[1] || '').trim()
+      if (p && existsSync(p)) toSend.add(p)
+    }
+
+    for (const filePath of toSend) {
+      try {
+        if (!existsSync(filePath) || !statSync(filePath).isFile()) continue
+        const name = basename(filePath)
+        const ext = name.split('.').pop()?.toLowerCase() ?? ''
+        if (['jpg', 'jpeg', 'png', 'webp'].includes(ext)) {
+          await this.bot.api.sendPhoto(this.account, new InputFile(filePath), {
+            caption: name,
+            ...threadOpt(this.dest),
+          })
+        } else {
+          await this.bot.api.sendDocument(this.account, new InputFile(filePath, name), {
+            caption: name,
+            ...threadOpt(this.dest),
+          })
+        }
+      } catch (err) {
+        log(`[${this.key}] failed to send file ${filePath}:`, err)
+      }
+    }
+
+    // Clean up [send_file: ...] tags from the text
+    const cleanText = t.text.replace(sendFileRe, '').trim()
+
     const parts: string[] = []
-    if (t.text.trim()) parts.push(t.text.trim())
-    if (t.plan.length && !t.text.trim()) parts.push(planMd(t.plan))
+    if (cleanText) parts.push(cleanText)
+    if (t.plan.length && !cleanText) parts.push(planMd(t.plan))
     const meta: string[] = []
     if (t.steps.length) meta.push(`🔧 ${t.steps.length} step${t.steps.length > 1 ? 's' : ''} · /steps`)
     meta.push(`${Math.round((Date.now() - t.started) / 1000)}s`)
@@ -443,7 +491,15 @@ export class AgentSession {
         if (u.content?.type === 'text') { t.thought += u.content.text; t.thinking = true }
         break
       case 'tool_call': {
-        if (t.text && !t.text.endsWith('\n\n')) t.text += '\n\n'
+        const intermediate = t.text.trim()
+        if (intermediate.length >= 20 && !intermediate.startsWith('⚠️')) {
+          void sendRich(this.bot, this.dest, intermediate).catch(e => log('intermediate send failed', e))
+          t.text = ''
+          t.lastDraft = ''
+          void this.pushDraft(true)
+        } else if (t.text && !t.text.endsWith('\n\n')) {
+          t.text += '\n\n'
+        }
         const st: Step = {
           id: u.toolCallId, label: u.title || u.name || 'tool', kind: u.kind ?? 'other',
           input: stepInput(u), output: null, status: u.status ?? 'pending',

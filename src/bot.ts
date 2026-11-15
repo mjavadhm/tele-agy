@@ -907,7 +907,9 @@ async function runShell(ctx: Context, cmd: string): Promise<void> {
 }
 
 async function download(fileId: string, name?: string): Promise<{ path: string; buf: Buffer }> {
+  log(`downloading file_id: ${fileId}`)
   const f = await bot.api.getFile(fileId)
+  log(`getFile result:`, f)
   if (!f.file_path) throw new Error('Telegram returned no file path')
   let buf: Buffer
   if (existsSync(f.file_path)) {
@@ -921,6 +923,7 @@ async function download(fileId: string, name?: string): Promise<{ path: string; 
   const safe = (name ?? basename(f.file_path)).replace(/[^\w.\-]+/g, '_')
   const path = join(INBOX, `${Date.now()}-${safe}`)
   writeFileSync(path, buf)
+  log(`saved attachment to: ${path} (${buf.length} bytes)`)
   return { path, buf }
 }
 
@@ -951,8 +954,10 @@ bot.on('message', async ctx => {
       blocks.push({ type: 'image', mimeType: 'image/jpeg', data: buf.toString('base64') })
     } else if (msg.document || msg.video || msg.audio || msg.voice) {
       const d: any = msg.document ?? msg.video ?? msg.audio ?? msg.voice
+      log(`incoming attachment: name=${d.file_name}, size=${d.file_size}, mime=${d.mime_type}`)
       if (d.file_size && d.file_size > MAX_FILE_BYTES) {
         const limitMb = Math.round(MAX_FILE_BYTES / (1024 * 1024))
+        log(`attachment rejected: file_size ${d.file_size} > MAX_FILE_BYTES ${MAX_FILE_BYTES}`)
         await ctx.reply(`That file is over ${limitMb} MB, the limit for bots. Put it on the server another way.`); return
       }
       const { path } = await download(d.file_id, d.file_name ?? (msg.voice ? 'voice.oga' : undefined))
@@ -960,14 +965,21 @@ bot.on('message', async ctx => {
         ? `${text}\n\n[The user sent a ${msg.voice ? 'voice message' : 'audio file'}, saved at: ${path}. Listen to it (open the file). Start your reply with what you heard, word for word in the language spoken, as a quote line beginning with "🎤", so they can check you heard correctly. Then treat what they said as their request and answer in the language they speak.]`.trim()
         : `${text}\n\n[The user sent a file, saved on the server at: ${path}]`.trim()
     }
-  } catch (e) { await ctx.reply(`⚠️ Couldn't download the attachment: ${e instanceof Error ? e.message : e}`); return }
+  } catch (e) {
+    log('download error:', e)
+    await ctx.reply(`⚠️ Couldn't download the attachment: ${e instanceof Error ? e.message : e}`); return
+  }
   if (msg.reply_to_message && 'text' in msg.reply_to_message && msg.reply_to_message.text) {
     text = `[Replying to: "${clip(msg.reply_to_message.text, 500)}"]\n\n${text}`
   }
-  if (text.trim()) blocks.push({ type: 'text', text })
+  if (text.trim()) {
+    const hint = '\n\n[Telegram Integration: To send any generated or requested file directly to the user as an attachment in Telegram, include [send_file: /path/to/file] in your response.]'
+    blocks.push({ type: 'text', text: text + hint })
+  }
   if (!blocks.length) return
+  if (msg.message_id) void ctx.react('👀').catch(() => {})
   // Don't await: grammY handles updates one at a time, and the turn may wait for a button press.
-  void sess(ctx).prompt(blocks).catch(e => log('prompt failed', e))
+  void sess(ctx).prompt(blocks, msg.message_id).catch(e => log('prompt failed', e))
 })
 
 // --- command menu ------------------------------------------------------------------------
