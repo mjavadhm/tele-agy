@@ -327,9 +327,10 @@ export class AgentSession {
     this.lastTurn = { prompt: t.prompt, text: t.text, steps: t.steps, plan: t.plan, note, secs: Math.round((Date.now() - t.started) / 1000) }
 
     // 1. Reactions on the user's message
+    const reactMatch = /(?:\[reaction:\s*([^\s\]]+)\]|\[react:\s*([^\s\]]+)\])/i.exec(t.text)
     if (t.msgId) {
-      const emoji = (note && !note.startsWith('✓')) ? '⚠️' : '✅'
-      void this.bot.api.setMessageReaction(this.account, t.msgId, [{ type: 'emoji', emoji }]).catch(() => {})
+      const emoji = reactMatch ? (reactMatch[1] || reactMatch[2]) : ((note && !note.startsWith('✓')) ? '⚠️' : '✅')
+      void this.bot.api.setMessageReaction(this.account, t.msgId, [{ type: 'emoji', emoji: emoji as any }]).catch(() => {})
     }
 
     // 2. Scan and send any attached / referenced files
@@ -368,8 +369,8 @@ export class AgentSession {
       }
     }
 
-    // Clean up [send_file: ...] tags from the text
-    const cleanText = t.text.replace(sendFileRe, '').trim()
+    // Clean up [send_file: ...] and [reaction: ...] tags from the text
+    const cleanText = t.text.replace(sendFileRe, '').replace(/(?:\[reaction:\s*[^\s\]]+\]|\[react:\s*[^\s\]]+\])/gi, '').trim()
 
     const parts: string[] = []
     if (cleanText) parts.push(cleanText)
