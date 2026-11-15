@@ -973,11 +973,21 @@ bot.on('message', async ctx => {
     text = `[Replying to: "${clip(msg.reply_to_message.text, 500)}"]\n\n${text}`
   }
   if (text.trim()) {
-    const hint = '\n\n[Telegram Integration: To send any generated or requested file directly to the user as an attachment in Telegram, include [send_file: /path/to/file] in your response.]'
+    const hint = '\n\n[Telegram Integration: You can send files mid-task using `tg send-file <path>` or [send_file: /path]. You can set a custom reaction using `tg react <emoji>` or [react: <emoji>]. You can send intermediate messages with `tg send "<text>"`.]'
     blocks.push({ type: 'text', text: text + hint })
   }
   if (!blocks.length) return
-  if (msg.message_id) void ctx.react('👀').catch(() => {})
+  if (msg.message_id) {
+    try {
+      writeFileSync('/tmp/tg-current.json', JSON.stringify({
+        chat_id: chatId(ctx),
+        thread: threadOf(ctx),
+        msg_id: msg.message_id,
+        api_root: API_ROOT,
+        token: TOKEN,
+      }))
+    } catch {}
+  }
   // Don't await: grammY handles updates one at a time, and the turn may wait for a button press.
   void sess(ctx).prompt(blocks, msg.message_id).catch(e => log('prompt failed', e))
 })

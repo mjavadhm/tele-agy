@@ -326,10 +326,10 @@ export class AgentSession {
     if (t.steps.length) this.lastSteps = t.steps
     this.lastTurn = { prompt: t.prompt, text: t.text, steps: t.steps, plan: t.plan, note, secs: Math.round((Date.now() - t.started) / 1000) }
 
-    // 1. Reactions on the user's message
+    // 1. Reactions on the user's message (only if explicitly requested by the agent)
     const reactMatch = /(?:\[reaction:\s*([^\s\]]+)\]|\[react:\s*([^\s\]]+)\])/i.exec(t.text)
-    if (t.msgId) {
-      const emoji = reactMatch ? (reactMatch[1] || reactMatch[2]) : ((note && !note.startsWith('✓')) ? '⚠️' : '✅')
+    if (t.msgId && reactMatch) {
+      const emoji = reactMatch[1] || reactMatch[2]
       void this.bot.api.setMessageReaction(this.account, t.msgId, [{ type: 'emoji', emoji: emoji as any }]).catch(() => {})
     }
 
