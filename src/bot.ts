@@ -41,7 +41,9 @@ const SHELL_LOG = join(DATA, 'shell.log')
 const AGY_SETTINGS = join(homedir(), '.gemini', 'antigravity-cli', 'settings.json')
 const log = (...a: unknown[]) => console.error(new Date().toISOString(), ...a)
 
-const bot = new Bot(TOKEN)
+const API_ROOT = (process.env.TELEGRAM_API_ROOT ?? 'https://api.telegram.org').replace(/\/+$/, '')
+const MAX_FILE_BYTES = (API_ROOT.includes('api.telegram.org') ? 20 : 2000) * 1024 * 1024
+const bot = new Bot(TOKEN, API_ROOT !== 'https://api.telegram.org' ? { client: { apiRoot: API_ROOT } } : undefined)
 const mgr = new SessionManager(bot)
 let botUsername = ''
 let topicsOn = false // forum topic mode in private chats (a @BotFather setting), read from getMe
@@ -907,9 +909,14 @@ async function runShell(ctx: Context, cmd: string): Promise<void> {
 async function download(fileId: string, name?: string): Promise<{ path: string; buf: Buffer }> {
   const f = await bot.api.getFile(fileId)
   if (!f.file_path) throw new Error('Telegram returned no file path')
-  const res = await fetch(`https://api.telegram.org/file/bot${TOKEN}/${f.file_path}`)
-  if (!res.ok) throw new Error(`download failed: HTTP ${res.status}`)
-  const buf = Buffer.from(await res.arrayBuffer())
+  let buf: Buffer
+  if (existsSync(f.file_path)) {
+    buf = readFileSync(f.file_path)
+  } else {
+    const res = await fetch(`${API_ROOT}/file/bot${TOKEN}/${f.file_path}`)
+    if (!res.ok) throw new Error(`download failed: HTTP ${res.status}`)
+    buf = Buffer.from(await res.arrayBuffer())
+  }
   mkdirSync(INBOX, { recursive: true })
   const safe = (name ?? basename(f.file_path)).replace(/[^\w.\-]+/g, '_')
   const path = join(INBOX, `${Date.now()}-${safe}`)
@@ -944,7 +951,10 @@ bot.on('message', async ctx => {
       blocks.push({ type: 'image', mimeType: 'image/jpeg', data: buf.toString('base64') })
     } else if (msg.document || msg.video || msg.audio || msg.voice) {
       const d: any = msg.document ?? msg.video ?? msg.audio ?? msg.voice
-      if (d.file_size && d.file_size > 20 * 1024 * 1024) { await ctx.reply('That file is over 20 MB, the limit for bots. Put it on the server another way.'); return }
+      if (d.file_size && d.file_size > MAX_FILE_BYTES) {
+        const limitMb = Math.round(MAX_FILE_BYTES / (1024 * 1024))
+        await ctx.reply(`That file is over ${limitMb} MB, the limit for bots. Put it on the server another way.`); return
+      }
       const { path } = await download(d.file_id, d.file_name ?? (msg.voice ? 'voice.oga' : undefined))
       text = msg.voice || msg.audio
         ? `${text}\n\n[The user sent a ${msg.voice ? 'voice message' : 'audio file'}, saved at: ${path}. Listen to it (open the file). Start your reply with what you heard, word for word in the language spoken, as a quote line beginning with "🎤", so they can check you heard correctly. Then treat what they said as their request and answer in the language they speak.]`.trim()
