@@ -973,7 +973,7 @@ bot.on('message', async ctx => {
     text = `[Replying to: "${clip(msg.reply_to_message.text, 500)}"]\n\n${text}`
   }
   if (text.trim()) {
-    const hint = '\n\n[Telegram Integration: You can send files mid-task using `tg send-file <path>` or [send_file: /path]. You can set a custom reaction using `tg react <emoji>` or [react: <emoji>]. You can send intermediate messages with `tg send "<text>"`.]'
+    const hint = '\n\n[Telegram Integration: You are in an active Telegram session. Send files mid-task using `tg send-file <path>` (or [send_file: /path]). React contextually using `tg react <emoji>` (or [react: <emoji>]). Send progress updates with `tg send "<text>"`. Detailed rules: TELEGRAM_GUIDELINES.md.]'
     blocks.push({ type: 'text', text: text + hint })
   }
   if (!blocks.length) return
